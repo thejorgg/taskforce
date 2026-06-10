@@ -1,0 +1,36 @@
+{
+  "pipeline": {
+    "scout": {
+      "enabled": false
+    }
+  },
+  "relay": {
+    "control": {
+      "agent": "codex",
+      "prompt": "Inspect the task and produce an implementation plan."
+    },
+    "build": {
+      "agent": "opencode",
+      "prompt": "Implement the approved plan and report changed files."
+    }
+  },
+  "scope": {
+    "hooks": [
+      {
+        "name": "lint",
+        "run": "npm run lint"
+      },
+      {
+        "name": "tests",
+        "run": "npm test"
+      }
+    ]
+  },
+  "exfil": {
+    "branch": "taskforce/{{task_id}}",
+    "commit": true,
+    "push": false,
+    "pr": false
+  }
+}
+
