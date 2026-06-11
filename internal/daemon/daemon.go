@@ -311,7 +311,7 @@ func Status(repo string) (State, bool, error) {
 	if err != nil {
 		return State{}, false, err
 	}
-	data, err := os.ReadFile(statePath(absRepo))
+	data, err := os.ReadFile(statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return State{}, false, nil
 	}
@@ -336,7 +336,7 @@ func markStopped(repo string, state State) error {
 }
 
 func writeState(repo string, state State) error {
-	return writeJSONAtomic(statePath(repo), state)
+	return writeJSONAtomic(statePath(), state)
 }
 
 func processAlive(pid int) bool {
@@ -367,8 +367,12 @@ func reposBase() string {
 	return filepath.Join(home, ".local", "share", "taskforce", "repos")
 }
 
-func statePath(repo string) string {
-	return filepath.Join(dir(repo), "daemon.json")
+func statePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "daemon.json"
+	}
+	return filepath.Join(home, ".local", "share", "taskforce", "daemon.json")
 }
 
 func queueDir(repo string) string {
@@ -381,10 +385,6 @@ func jobsDir(repo string) string {
 
 func queuePath(repo, id string) string {
 	return filepath.Join(queueDir(repo), id+".json")
-}
-
-func jobPath(repo, id string) string {
-	return filepath.Join(jobsDir(repo), id+".json")
 }
 
 func eventsPath(repo, id string) string {
@@ -457,32 +457,6 @@ func processRepoPending(ctx context.Context, repoDir string, wg *sync.WaitGroup)
 		}(job)
 	}
 	return nil
-}
-
-func executeJob(ctx context.Context, repo string, job Job) {
-	timeout, _ := time.ParseDuration(job.Options.Timeout)
-	r := runner.Runner{Options: runner.Options{
-		Repo:    job.Repo,
-		Shell:   job.Options.Shell,
-		Timeout: timeout,
-		Env:     job.Options.Env,
-		Yes:     job.Options.Yes,
-		Yolo:    job.Options.Yolo,
-		OnOutput: func(name, stream, text string) {
-			_ = appendEventFile(eventsPath(repo, job.ID), JobEvent{JobID: job.ID, Command: name, Stream: stream, Text: text, CreatedAt: time.Now()})
-		},
-	}}
-	result := r.Run(ctx, job.Spec)
-	job.Result = &result
-	job.EndedAt = time.Now()
-	if result.ExitCode == 0 {
-		job.Status = JobPassed
-	} else {
-		job.Status = JobFailed
-	}
-	if err := writeJSONAtomic(jobPath(repo, job.ID), job); err != nil {
-		appendDaemonLog(repo, "job write error: "+err.Error())
-	}
 }
 
 func executeJobInDir(ctx context.Context, repoDir string, job Job) {
