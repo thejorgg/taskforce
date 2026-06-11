@@ -163,7 +163,7 @@ func showCLICommand(branch string) {
 	fmt.Printf("\nTo resolve the conflict, run:\n")
 	fmt.Printf("  git merge %s\n", branch)
 	fmt.Printf("  # resolve conflicts, then:\n")
-	fmt.Printf("  git add .\n")
+	fmt.Printf("  git add -u\n")
 	fmt.Printf("  git commit -m \"Merge %s\"\n\n", branch)
 }
 
@@ -194,7 +194,7 @@ func abortMerge(path string) error {
 }
 
 func commitMerge(path, branch, target string) error {
-	cmd := exec.Command("git", "add", ".")
+	cmd := exec.Command("git", "add", "-u")
 	cmd.Dir = path
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -218,7 +218,10 @@ type ExfilWarning struct {
 func storeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = filepath.Join(os.Getenv("HOME"), ".local", "share")
+		home = os.Getenv("HOME")
+	}
+	if home == "" {
+		return ""
 	}
 	return filepath.Join(home, ".local", "share", "taskforce")
 }

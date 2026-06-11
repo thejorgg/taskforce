@@ -206,8 +206,25 @@ func readDecision(repo, id string) (ApprovalDecision, bool, error) {
 	return decision, true, nil
 }
 
-func processRunQueue(ctx context.Context, repo string, wg *sync.WaitGroup) error {
-	paths, err := filepath.Glob(filepath.Join(runQueueDir(repo), "*.json"))
+func processRunQueue(ctx context.Context, wg *sync.WaitGroup) error {
+	base := reposBase()
+	if base == "" {
+		return nil
+	}
+	repoDirs, err := filepath.Glob(filepath.Join(base, "*"))
+	if err != nil {
+		return err
+	}
+	for _, repoDir := range repoDirs {
+		if err := processRepoRunQueue(ctx, repoDir, wg); err != nil {
+			appendDaemonLog(repoDir, "run queue error: "+err.Error())
+		}
+	}
+	return nil
+}
+
+func processRepoRunQueue(ctx context.Context, repoDir string, wg *sync.WaitGroup) error {
+	paths, err := filepath.Glob(filepath.Join(repoDir, "runqueue", "*.json"))
 	if err != nil {
 		return err
 	}
@@ -228,20 +245,20 @@ func processRunQueue(ctx context.Context, repo string, wg *sync.WaitGroup) error
 			_ = os.Remove(claim)
 			return err
 		}
-		if err := os.MkdirAll(runsDir(repo), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(repoDir, "runs"), 0o755); err != nil {
 			return err
 		}
 		record.Status = RunRunning
 		record.StartedAt = time.Now()
 		record.DaemonPID = os.Getpid()
-		if err := writeJSONAtomic(runPath(repo, record.ID), record); err != nil {
+		if err := writeJSONAtomic(filepath.Join(repoDir, "runs", record.ID+".json"), record); err != nil {
 			return err
 		}
 		_ = os.Remove(claim)
 		wg.Add(1)
 		go func(rec RunRecord) {
 			defer wg.Done()
-			executeRun(ctx, repo, rec)
+			executeRun(ctx, record.Repo, rec)
 		}(record)
 	}
 	return nil
@@ -378,7 +395,7 @@ func recoverStaleRuns(repo string) {
 	if err != nil {
 		return
 	}
-	state, stateOK, _ := Status(repo)
+	state, stateOK, _ := Status()
 	for _, record := range records {
 		if !record.Status.Active() || record.Status == RunPending {
 			continue

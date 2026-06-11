@@ -1,5 +1,6 @@
-// Package daemon owns local TaskForce state under .taskforce/: the heartbeat,
-// queued command jobs, pipeline runs, approvals, and streamed process output.
+// Package daemon owns the machine-wide TaskForce state under
+// ~/.local/share/taskforce/: the heartbeat, queued command jobs, pipeline
+// runs, approvals, and streamed process output.
 package daemon
 
 import (
@@ -21,9 +22,31 @@ import (
 	"github.com/thejorgg/taskforce/internal/runner"
 )
 
+var (
+	cachedHome    string
+	cachedHomeErr error
+	homeMu        sync.Mutex
+	homeCached    bool
+)
+
+func cachedUserHomeDir() (string, error) {
+	homeMu.Lock()
+	defer homeMu.Unlock()
+	if !homeCached {
+		cachedHome, cachedHomeErr = os.UserHomeDir()
+		homeCached = true
+	}
+	return cachedHome, cachedHomeErr
+}
+
+func resetHomeCache() {
+	homeMu.Lock()
+	defer homeMu.Unlock()
+	homeCached = false
+}
+
 type State struct {
 	PID       int       `json:"pid"`
-	Repo      string    `json:"repo"`
 	Status    string    `json:"status"`
 	StartedAt time.Time `json:"started_at"`
 	Heartbeat time.Time `json:"heartbeat"`
@@ -72,7 +95,7 @@ func Start(repo string) (State, error) {
 	if err != nil {
 		return State{}, err
 	}
-	if state, ok, err := Status(absRepo); err != nil {
+	if state, ok, err := Status(); err != nil {
 		return State{}, err
 	} else if ok && state.Status == "running" {
 		return state, nil
@@ -96,8 +119,8 @@ func Start(repo string) (State, error) {
 	if err := cmd.Start(); err != nil {
 		return State{}, err
 	}
-	state := State{PID: cmd.Process.Pid, Repo: absRepo, Status: "running", StartedAt: time.Now(), Heartbeat: time.Now()}
-	if err := writeState(absRepo, state); err != nil {
+	state := State{PID: cmd.Process.Pid, Status: "running", StartedAt: time.Now(), Heartbeat: time.Now()}
+			if err := writeState(state); err != nil {
 		_ = cmd.Process.Kill()
 		return State{}, err
 	}
@@ -116,8 +139,8 @@ func Run(repo string) error {
 		return err
 	}
 	recoverStaleRuns(absRepo)
-	state := State{PID: os.Getpid(), Repo: absRepo, Status: "running", StartedAt: time.Now(), Heartbeat: time.Now()}
-	if err := writeState(absRepo, state); err != nil {
+	state := State{PID: os.Getpid(), Status: "running", StartedAt: time.Now(), Heartbeat: time.Now()}
+	if err := writeState(state); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -131,13 +154,13 @@ func Run(repo string) error {
 		select {
 		case <-ticker.C:
 			state.Heartbeat = time.Now()
-			if err := writeState(absRepo, state); err != nil {
+	if err := writeState(state); err != nil {
 				return err
 			}
 			if err := processPending(ctx, &wg); err != nil {
 				appendDaemonLog(absRepo, "queue error: "+err.Error())
 			}
-			if err := processRunQueue(ctx, absRepo, &wg); err != nil {
+			if err := processRunQueue(ctx, &wg); err != nil {
 				appendDaemonLog(absRepo, "run queue error: "+err.Error())
 			}
 		case <-stop:
@@ -145,7 +168,7 @@ func Run(repo string) error {
 			waitWithTimeout(&wg, 3*time.Second)
 			state.Status = "stopped"
 			state.Heartbeat = time.Now()
-			return writeState(absRepo, state)
+			return writeState(state)
 		}
 	}
 }
@@ -284,8 +307,8 @@ func readEventsFile(path string) ([]JobEvent, error) {
 	return events, nil
 }
 
-func Stop(repo string) error {
-	state, ok, err := Status(repo)
+func Stop(_ string) error {
+	state, ok, err := Status()
 	if err != nil || !ok {
 		return err
 	}
@@ -296,21 +319,17 @@ func Stop(repo string) error {
 			deadline := time.Now().Add(5 * time.Second)
 			for time.Now().Before(deadline) {
 				if !processAlive(state.PID) {
-					return markStopped(state.Repo, state)
+					return markStopped(state)
 				}
 				time.Sleep(50 * time.Millisecond)
 			}
 			_ = process.Kill()
 		}
 	}
-	return markStopped(state.Repo, state)
+	return markStopped(state)
 }
 
-func Status(repo string) (State, bool, error) {
-	absRepo, err := filepath.Abs(repo)
-	if err != nil {
-		return State{}, false, err
-	}
+func Status() (State, bool, error) {
 	data, err := os.ReadFile(statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return State{}, false, nil
@@ -324,18 +343,18 @@ func Status(repo string) (State, bool, error) {
 	}
 	if state.PID <= 0 || !processAlive(state.PID) {
 		state.Status = "stopped"
-		_ = writeState(absRepo, state)
+		_ = writeState(state)
 	}
 	return state, true, nil
 }
 
-func markStopped(repo string, state State) error {
+func markStopped(state State) error {
 	state.Status = "stopped"
 	state.Heartbeat = time.Now()
-	return writeState(repo, state)
+	return writeState(state)
 }
 
-func writeState(repo string, state State) error {
+func writeState(state State) error {
 	return writeJSONAtomic(statePath(), state)
 }
 
@@ -351,7 +370,7 @@ func processAlive(pid int) bool {
 }
 
 func dir(repo string) string {
-	home, err := os.UserHomeDir()
+	home, err := cachedUserHomeDir()
 	if err != nil {
 		return filepath.Join(repo, ".taskforce")
 	}
@@ -360,7 +379,7 @@ func dir(repo string) string {
 }
 
 func reposBase() string {
-	home, err := os.UserHomeDir()
+	home, err := cachedUserHomeDir()
 	if err != nil {
 		return ""
 	}
@@ -368,7 +387,7 @@ func reposBase() string {
 }
 
 func statePath() string {
-	home, err := os.UserHomeDir()
+	home, err := cachedUserHomeDir()
 	if err != nil {
 		return "daemon.json"
 	}

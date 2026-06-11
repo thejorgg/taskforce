@@ -26,7 +26,10 @@ type Registry struct {
 func registryDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = filepath.Join(os.Getenv("HOME"), ".local", "share")
+		home = os.Getenv("HOME")
+	}
+	if home == "" {
+		return ""
 	}
 	return filepath.Join(home, ".local", "share", "taskforce", "worktrees")
 }

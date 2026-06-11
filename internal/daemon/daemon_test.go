@@ -14,6 +14,8 @@ import (
 )
 
 func TestSubmitProcessPendingWritesResultAndEvents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := t.TempDir()
 	spec := domain.CommandSpec{Name: "scope.test", Run: "printf daemon-output"}
 	job, err := Submit(repo, runner.Options{Timeout: time.Minute, Yes: true}, spec)
@@ -77,6 +79,8 @@ const echoPipelineConfig = `{
 }`
 
 func TestRunLifecyclePasses(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, echoPipelineConfig)
 	record, err := SubmitRun(repo, JobOptions{Timeout: "1m"}, "test", "Fix the login button")
 	if err != nil {
@@ -86,7 +90,7 @@ func TestRunLifecyclePasses(t *testing.T) {
 		t.Fatalf("submitted status = %s", record.Status)
 	}
 	var wg sync.WaitGroup
-	if err := processRunQueue(context.Background(), repo, &wg); err != nil {
+	if err := processRunQueue(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
@@ -113,6 +117,8 @@ func TestRunLifecyclePasses(t *testing.T) {
 }
 
 func TestRunFailureFromFailingBuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, `{
   "relay": {
     "control": {"enabled": false},
@@ -126,7 +132,7 @@ func TestRunFailureFromFailingBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	if err := processRunQueue(context.Background(), repo, &wg); err != nil {
+	if err := processRunQueue(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
@@ -150,13 +156,15 @@ const approvalPipelineConfig = `{
 }`
 
 func TestRunPausesForApprovalAndApproves(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, approvalPipelineConfig)
 	record, err := SubmitRun(repo, JobOptions{Timeout: "1m"}, "test", "Ship it")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	if err := processRunQueue(context.Background(), repo, &wg); err != nil {
+	if err := processRunQueue(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	waitForStatus(t, repo, record.ID, RunAwaitingApproval)
@@ -184,13 +192,15 @@ func TestRunPausesForApprovalAndApproves(t *testing.T) {
 }
 
 func TestRunPausesForApprovalAndDenies(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, approvalPipelineConfig)
 	record, err := SubmitRun(repo, JobOptions{Timeout: "1m"}, "test", "Ship it")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	if err := processRunQueue(context.Background(), repo, &wg); err != nil {
+	if err := processRunQueue(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	waitForStatus(t, repo, record.ID, RunAwaitingApproval)
@@ -205,13 +215,15 @@ func TestRunPausesForApprovalAndDenies(t *testing.T) {
 }
 
 func TestYesSkipsApprovalGate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, approvalPipelineConfig)
 	record, err := SubmitRun(repo, JobOptions{Timeout: "1m", Yes: true}, "test", "Ship it")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	if err := processRunQueue(context.Background(), repo, &wg); err != nil {
+	if err := processRunQueue(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
@@ -222,6 +234,8 @@ func TestYesSkipsApprovalGate(t *testing.T) {
 }
 
 func TestApproveUnknownRunFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := t.TempDir()
 	if err := Approve(repo, "tf-missing", ""); err == nil {
 		t.Fatal("approving a missing run must fail")
@@ -229,6 +243,8 @@ func TestApproveUnknownRunFails(t *testing.T) {
 }
 
 func TestApproveBeforeApprovalGateFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
 	repo := testRepoConfig(t, approvalPipelineConfig)
 	record, err := SubmitRun(repo, JobOptions{Timeout: "1m"}, "test", "Ship it")
 	if err != nil {
@@ -257,4 +273,40 @@ func waitForStatus(t *testing.T, repo, id string, want RunStatus) {
 	}
 	record, _, _ := ReadRun(repo, id)
 	t.Fatalf("run never reached %s; last = %s (%s)", want, record.Status, record.Error)
+}
+
+func TestProcessPendingDiscoversMultipleRepos(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHomeCache()
+	repo1 := t.TempDir()
+	repo2 := t.TempDir()
+	spec1 := domain.CommandSpec{Name: "scope.m1", Run: "printf repo1-output"}
+	spec2 := domain.CommandSpec{Name: "scope.m2", Run: "printf repo2-output"}
+	job1, err := Submit(repo1, runner.Options{Timeout: time.Minute}, spec1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job2, err := Submit(repo2, runner.Options{Timeout: time.Minute}, spec2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	if err := processPending(context.Background(), &wg); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	done1, ok, err := ReadJob(repo1, job1.ID)
+	if err != nil || !ok {
+		t.Fatalf("job1: ok=%v err=%v", ok, err)
+	}
+	if done1.Status != JobPassed || done1.Result == nil || !strings.Contains(done1.Result.Stdout, "repo1-output") {
+		t.Fatalf("job1 result = %#v", done1)
+	}
+	done2, ok, err := ReadJob(repo2, job2.ID)
+	if err != nil || !ok {
+		t.Fatalf("job2: ok=%v err=%v", ok, err)
+	}
+	if done2.Status != JobPassed || done2.Result == nil || !strings.Contains(done2.Result.Stdout, "repo2-output") {
+		t.Fatalf("job2 result = %#v", done2)
+	}
 }
