@@ -3,17 +3,20 @@ package exfil
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/thejorgg/taskforce/internal/config"
 	"github.com/thejorgg/taskforce/internal/domain"
+	"github.com/thejorgg/taskforce/internal/merge"
 	"github.com/thejorgg/taskforce/internal/runner"
 )
 
 type Releaser struct {
-	Config config.ExfilConfig
-	Runner runner.Runner
+	Config       config.ExfilConfig
+	Runner       runner.Runner
+	RecentMerges []string
 }
 
 func (r Releaser) Release(ctx context.Context, task domain.TaskPacket, review domain.ReviewResult) domain.ReleaseResult {
@@ -59,6 +62,9 @@ func (r Releaser) Release(ctx context.Context, task domain.TaskPacket, review do
 		}
 	}
 	if r.Config.Push {
+		if warning := merge.CheckMergeWarning(branch, r.RecentMerges); warning != nil {
+			fmt.Fprintln(os.Stderr, warning.Message)
+		}
 		target := "HEAD"
 		if branch != "" {
 			target = branch
@@ -72,6 +78,9 @@ func (r Releaser) Release(ctx context.Context, task domain.TaskPacket, review do
 		}
 	}
 	if r.Config.PR {
+		if warning := merge.CheckMergeWarning(branch, r.RecentMerges); warning != nil {
+			fmt.Fprintln(os.Stderr, warning.Message)
+		}
 		if _, err := exec.LookPath("gh"); err != nil {
 			out.Results = append(out.Results, domain.CommandResult{Name: "exfil.pr", ExitCode: 127, Error: "gh not found; install GitHub CLI or disable exfil.pr"})
 			out.Skipped = true

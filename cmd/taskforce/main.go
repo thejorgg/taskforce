@@ -66,6 +66,8 @@ func run(args []string) error {
 		return agentsCmd(args[1:])
 	case "worktree":
 		return worktreeCmd(args[1:])
+	case "merge-all":
+		return mergeCmd(args[1:])
 	case "doctor":
 		return doctorCmd(args[1:])
 	case "version", "--version", "-v":
@@ -259,6 +261,7 @@ Usage:
   taskforce init [--level profile|project|workspace]
   taskforce config check|show|set|unset ...
   taskforce worktree add|list|remove [--repo PATH]
+  taskforce merge-all [--target BRANCH] [--repo PATH]
   taskforce daemon start|status|stop [--repo PATH]
   taskforce version`)
 }
