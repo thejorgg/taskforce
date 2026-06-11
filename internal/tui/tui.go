@@ -55,6 +55,15 @@ type Model struct {
 	// static is true when showing one finished run with no daemon polling.
 	static bool
 
+	// animation state
+	viewChangedAt      time.Time
+	quitPromptAt       time.Time
+	quitting           bool
+	quitStartedAt      time.Time
+	agentsStopped      bool
+	animTickInFlight   bool
+	animOff            bool
+
 	run         domain.PipelineRun
 	record      *daemon.RunRecord
 	activeRunID string
@@ -119,11 +128,24 @@ type artifactHit struct {
 }
 
 type tickMsg time.Time
+type animMsg time.Time
+type agentsStoppedMsg struct{}
 
 const refreshInterval = 300 * time.Millisecond
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func animTickCmd() tea.Cmd {
+	return tea.Tick(animTickRate, func(t time.Time) tea.Msg { return animMsg(t) })
+}
+
+func maybeAnimTick(m Model) tea.Cmd {
+	if m.animActive() && !m.animTickInFlight {
+		return animTickCmd()
+	}
+	return nil
 }
 
 // New shows a single finished pipeline run as a static result view.
@@ -161,12 +183,37 @@ func baseModel(repo string) Model {
 		operator:             operatorName(),
 		started:              time.Now(),
 		settingsDropdownOpen: -1,
+		animOff:              os.Getenv("TASKFORCE_REDUCE_MOTION") != "",
+		viewChangedAt:        time.Now(),
 		run: domain.PipelineRun{
 			Repo:      repo,
 			StartedAt: time.Now(),
 			Stages:    idleStages(),
 		},
 	}
+}
+
+func (m Model) animActive() bool {
+	if m.animOff {
+		return false
+	}
+	if !m.viewChangedAt.IsZero() && animProgress(m.viewChangedAt, uncensorDuration) < 1 {
+		return true
+	}
+	if m.quitPrompt && !m.quitPromptAt.IsZero() && animProgress(m.quitPromptAt, uncensorDuration) < 1 {
+		return true
+	}
+	if m.quitting && !m.quitStartedAt.IsZero() && animProgress(m.quitStartedAt, recensorDuration) < 1 {
+		return true
+	}
+	return false
+}
+
+func (m Model) phase() float64 {
+	if m.started.IsZero() {
+		return 0
+	}
+	return float64(time.Since(m.started)) / float64(refreshInterval)
 }
 
 func Show(run domain.PipelineRun) error {
@@ -190,7 +237,7 @@ func (m Model) Init() tea.Cmd {
 	if m.static {
 		return nil
 	}
-	return tickCmd()
+	return tea.Batch(tickCmd(), maybeAnimTick(m))
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -199,8 +246,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.static {
 			return m, nil
 		}
+		if m.quitting && (m.agentsStopped || time.Since(m.quitStartedAt) >= recensorDuration) {
+			return m, tea.Quit
+		}
 		m.refresh()
-		return m, tickCmd()
+		return m, tea.Batch(tickCmd(), maybeAnimTick(m))
+	case animMsg:
+		m.animTickInFlight = false
+		if m.quitting && (m.agentsStopped || time.Since(m.quitStartedAt) >= recensorDuration) {
+			return m, tea.Quit
+		}
+		if !m.animActive() {
+			return m, nil
+		}
+		return m, maybeAnimTick(m)
+	case agentsStoppedMsg:
+		m.agentsStopped = true
+		return m, tea.Quit
 	case editorResult:
 		if m.fileModal != nil {
 			if msg.err != nil {
@@ -242,6 +304,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch key {
 		case "ctrl+c":
 			m.quitPrompt = true
+			m.quitPromptAt = time.Now()
 			return m, nil
 		case "esc":
 			m.setView(viewFeed)
@@ -930,7 +993,10 @@ func (m Model) updateQuitPrompt(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "Y", "s", "S", "ctrl+c":
 		m.cmdStatus = "stopping local agents"
-		return m, stopLocalAgentsAndQuit(m.repo)
+		m.quitting = true
+		m.quitStartedAt = time.Now()
+		m.animTickInFlight = false
+		return m, tea.Batch(stopLocalAgentsCmd(m.repo), maybeAnimTick(m))
 	case "n", "N", "k", "K", "enter":
 		m.cmdStatus = "keeping local daemon running"
 		return m, tea.Quit
@@ -943,25 +1009,34 @@ func (m Model) updateQuitPrompt(key string) (tea.Model, tea.Cmd) {
 	}
 }
 
-func stopLocalAgentsAndQuit(repo string) tea.Cmd {
+func stopLocalAgentsCmd(repo string) tea.Cmd {
 	return func() tea.Msg {
 		_ = daemon.Stop(repo)
-		return tea.Quit()
+		return agentsStoppedMsg{}
 	}
 }
 
 func (m Model) quitPromptView() string {
+	title := "taskforce shutdown"
+	options := "Stop local agents?\n\n[y] stop local agents and quit\n[n] keep local daemon running and quit\n[enter] keep daemon\n[esc] cancel\n\n" + dim.Render("ctrl-c stops local agents and quits")
+	if !m.animOff && !m.quitPromptAt.IsZero() {
+		p := animProgress(m.quitPromptAt, typewriterDuration)
+		title = typewriter(title, p)
+		up := animProgress(m.quitPromptAt, uncensorDuration)
+		options = uncensor(options, up, maxInt(10, m.width-4))
+	}
+	if m.quitting {
+		sp := spinner(animProgress(m.quitStartedAt, 200*time.Millisecond))
+		title = "STOPPING AGENTS " + sp
+		if !m.animOff {
+			rp := animProgress(m.quitStartedAt, recensorDuration)
+			options = recensor("Stop local agents?\n\n[y] stop local agents and quit\n[n] keep local daemon running and quit", rp, maxInt(10, m.width-4))
+		}
+	}
 	lines := []string{
-		"taskforce shutdown",
+		title,
 		"",
-		"Stop local agents?",
-		"",
-		"[y] stop local agents and quit",
-		"[n] keep local daemon running and quit",
-		"[enter] keep daemon",
-		"[esc] cancel",
-		"",
-		dim.Render("ctrl-c stops local agents and quits"),
+		options,
 	}
 	return lipgloss.NewStyle().
 		Width(m.width).
@@ -978,6 +1053,9 @@ func (m *Model) setView(view viewName) {
 				m.settingsSel = 0
 				m.settingsDropdownOpen = -1
 				m.settingsDropdownCur = 0
+			}
+			if m.view != view {
+				m.viewChangedAt = time.Now()
 			}
 			m.view = view
 			m.syncMain()

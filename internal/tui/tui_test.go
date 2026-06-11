@@ -252,6 +252,7 @@ func TestViewRendersAtTinySize(t *testing.T) {
 func newTestModel(t *testing.T, width, height int) Model {
 	t.Helper()
 	m := baseModel(t.TempDir())
+	m.animOff = true
 	m.width = width
 	m.height = height
 	m.resize()
@@ -533,4 +534,109 @@ func TestSafeArtifactPathRejectsTraversal(t *testing.T) {
 func TestEditorCmdReturnsSomething(t *testing.T) {
 	ed := editorCmd()
 	t.Logf("editorCmd = %q", ed)
+}
+
+func TestSetViewRecordsTimestamp(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.viewChangedAt = time.Time{}
+	m.setView(viewDispatch)
+	if m.viewChangedAt.IsZero() {
+		t.Fatal("viewChangedAt should be set after setView")
+	}
+}
+
+func TestSetViewSameViewDoesNotResetTimestamp(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewFeed)
+	ts := m.viewChangedAt
+	m.setView(viewFeed)
+	if m.viewChangedAt != ts {
+		t.Fatal("viewChangedAt should not change when view is the same")
+	}
+}
+
+func TestAnimMsgReschedules(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.animOff = false
+	m.viewChangedAt = time.Now()
+	_, cmd := updateTestModelWithCmd(t, m, animMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("animMsg should reschedule when animation is active")
+	}
+}
+
+func TestAnimMsgStopsWhenInactive(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.animOff = true
+	_, cmd := updateTestModelWithCmd(t, m, animMsg(time.Now()))
+	if cmd != nil {
+		t.Fatal("animMsg should not reschedule when animOff")
+	}
+}
+
+func TestQuitPromptYStartsQuitting(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.quitPrompt = true
+
+	m, cmd := updateTestModelWithCmd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+
+	if !m.quitting {
+		t.Fatal("quitting should be true after 'y'")
+	}
+	if cmd == nil {
+		t.Fatal("expected a command (batch)")
+	}
+}
+
+func TestAgentsStoppedMsgQuits(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.quitting = true
+	m.quitStartedAt = time.Now().Add(-time.Second)
+
+	_, cmd := updateTestModelWithCmd(t, m, agentsStoppedMsg{})
+
+	if cmd == nil {
+		t.Fatal("agentsStoppedMsg should trigger tea.Quit")
+	}
+}
+
+func TestRunningStageShowsSpinner(t *testing.T) {
+	stage := domain.StageSnapshot{
+		Name:   domain.StageRelay,
+		Status: domain.StatusRunning,
+	}
+	line := stageStateLine(stage)
+	if !strings.Contains(line, "▚") && !strings.Contains(line, "▞") {
+		t.Fatalf("running stage should show spinner, got: %q", line)
+	}
+}
+
+func TestReduceMotionEnvDisablesAnimations(t *testing.T) {
+	t.Setenv("TASKFORCE_REDUCE_MOTION", "1")
+	m := baseModel(t.TempDir())
+	if !m.animOff {
+		t.Fatal("animOff should be true when TASKFORCE_REDUCE_MOTION is set")
+	}
+}
+
+func TestReduceMotionRendersFullyStatic(t *testing.T) {
+	t.Setenv("TASKFORCE_REDUCE_MOTION", "1")
+	m := newTestModel(t, 80, 24)
+	m.quitPrompt = true
+	m.quitPromptAt = time.Now()
+	view := m.View()
+	if strings.Contains(view, "█") || strings.Contains(view, "▓") {
+		t.Fatalf("reduce motion should not show animation chars, got: %q", view)
+	}
+}
+
+func TestViewRendersMidAnimationNoPanic(t *testing.T) {
+	m := newTestModel(t, 40, 10)
+	m.animOff = false
+	m.viewChangedAt = time.Now()
+	m.syncMain()
+	view := m.View()
+	if view == "" {
+		t.Fatal("empty view mid-animation")
+	}
 }

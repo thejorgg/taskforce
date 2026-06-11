@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/thejorgg/taskforce/internal/domain"
@@ -289,7 +290,7 @@ func stageStateLine(stage domain.StageSnapshot) string {
 	symbol := "○"
 	switch stage.Status {
 	case domain.StatusRunning:
-		symbol = "●"
+		symbol = spinner(float64(time.Now().UnixNano()) / float64(refreshInterval))
 	case domain.StatusPassed:
 		symbol = "✓"
 	case domain.StatusNeedsRevision:

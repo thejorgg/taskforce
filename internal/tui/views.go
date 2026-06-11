@@ -104,10 +104,21 @@ func (m Model) mainWindow(f frame) string {
 		right = "esc to return"
 		tone = toneAccent
 	}
+	if m.view == viewFeed && m.activeRunID != "" {
+		right = "streaming " + spinner(m.phase())
+	}
 	if m.view == viewExfil && m.approvalPending() {
 		tone = toneWarn
 	}
-	return box(title, right, m.main.View(), m.width, tone)
+	content := m.main.View()
+	if !m.animOff && !m.viewChangedAt.IsZero() {
+		p := animProgress(m.viewChangedAt, uncensorDuration)
+		if p < 1 {
+			title = typewriter(title, animProgress(m.viewChangedAt, typewriterDuration))
+			content = uncensor(content, p, maxInt(10, m.width-4))
+		}
+	}
+	return box(title, right, content, m.width, tone)
 }
 
 const (
@@ -177,7 +188,7 @@ func (m Model) feedView() string {
 		lines = append(lines, stageLogLines(stage, strings.ToLower(string(stage.Name)))...)
 	}
 	if tail := m.liveEventTail(30); len(tail) > 0 {
-		lines = append(lines, rule("live output"))
+		lines = append(lines, rule("live output "+cylonDots(m.phase())))
 		lines = append(lines, tail...)
 	}
 	if len(lines) < 4 {
@@ -308,7 +319,11 @@ func (m Model) relayPaneView() string {
 		lines = append(lines, m.relayBuildPane()...)
 	}
 	if out := m.eventLines(command, 80); len(out) > 0 {
-		lines = append(lines, "", rule("process output"))
+		label := "process output"
+		if m.record != nil && m.record.Status.Active() {
+			label += " " + cylonDots(m.phase())
+		}
+		lines = append(lines, "", rule(label))
 		lines = append(lines, out...)
 	}
 	return strings.Join(lines, "\n")
@@ -380,7 +395,11 @@ func (m Model) scopeView() string {
 		lines = append(lines, "", rule("verdict"), string(m.run.Review.Status)+" · "+reason)
 	}
 	if out := m.eventLines("scope.", 30); len(out) > 0 {
-		lines = append(lines, "", rule("process output"))
+		label := "process output"
+		if m.record != nil && m.record.Status.Active() {
+			label += " " + cylonDots(m.phase())
+		}
+		lines = append(lines, "", rule(label))
 		lines = append(lines, out...)
 	}
 	lines = append(lines, "", rule("recent activity"),
@@ -441,7 +460,11 @@ func (m Model) exfilView() string {
 		lines = append(lines, "", rule("handoff"), strings.Join(summary, " · "))
 	}
 	if out := m.eventLines("exfil.", 30); len(out) > 0 {
-		lines = append(lines, "", rule("process output"))
+		label := "process output"
+		if m.record != nil && m.record.Status.Active() {
+			label += " " + cylonDots(m.phase())
+		}
+		lines = append(lines, "", rule(label))
 		lines = append(lines, out...)
 	}
 	lines = append(lines, "", rule("recent activity"),
@@ -612,7 +635,7 @@ func runStatusCell(status daemon.RunStatus) string {
 	case daemon.RunAwaitingApproval:
 		return warn.Render("⏸ " + label)
 	case daemon.RunRunning:
-		return accent.Render("● " + label)
+		return accent.Render(spinner(float64(time.Now().UnixNano())/float64(refreshInterval))) + accent.Render(" "+label)
 	default:
 		return dim.Render("○ " + label)
 	}

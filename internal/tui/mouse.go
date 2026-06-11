@@ -150,6 +150,7 @@ func (m Model) applyAction(action string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "quit":
 		m.quitPrompt = true
+		m.quitPromptAt = time.Now()
 	case "next":
 		m.cycleView(1)
 	case "approve":
