@@ -23,6 +23,9 @@ func (r Releaser) Release(ctx context.Context, task domain.TaskPacket, review do
 	if review.Status != domain.ReviewApproved {
 		return domain.ReleaseResult{Skipped: true}
 	}
+	if len(r.RecentMerges) == 0 {
+		r.RecentMerges = merge.LoadRecentMerges()
+	}
 	out := domain.ReleaseResult{}
 	branch := render(r.Config.Branch, task)
 	if branch != "" {

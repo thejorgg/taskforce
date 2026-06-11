@@ -32,9 +32,15 @@ func mergeCmd(args []string) error {
 
 	fmt.Printf("Merging all worktree branches into %q...\n\n", *target)
 
-	results, err := merge.MergeAll(absRepo, *target)
+	results, mergedBranches, err := merge.MergeAll(absRepo, *target)
 	if err != nil {
 		return err
+	}
+
+	if len(mergedBranches) > 0 {
+		if storeErr := merge.StoreRecentMerges(mergedBranches); storeErr != nil {
+			fmt.Printf("Warning: could not save recent merges: %v\n", storeErr)
+		}
 	}
 
 	fmt.Println("\nMerge results:")

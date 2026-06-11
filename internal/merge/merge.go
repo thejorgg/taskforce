@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/thejorgg/taskforce/internal/worktree"
@@ -27,35 +28,55 @@ type MergeResult struct {
 	Error    error
 }
 
-func MergeAll(repo, target string) ([]MergeResult, error) {
-	worktrees, err := worktree.List(repo)
+func MergeAll(repo, target string) ([]MergeResult, []string, error) {
+	absRepo, err := filepath.Abs(repo)
 	if err != nil {
-		return nil, fmt.Errorf("listing worktrees: %w", err)
+		return nil, nil, fmt.Errorf("resolving repo path: %w", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(absRepo, ".git")); err != nil {
+		return nil, nil, fmt.Errorf("not a git repository: %s", absRepo)
+	}
+
+	worktrees, err := worktree.List(absRepo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing worktrees: %w", err)
 	}
 
 	if len(worktrees) == 0 {
-		return nil, fmt.Errorf("no tracked worktrees found")
+		return nil, nil, fmt.Errorf("no tracked worktrees found")
+	}
+
+	checkout := exec.Command("git", "checkout", target)
+	checkout.Dir = absRepo
+	output, err := checkout.CombinedOutput()
+	if err != nil {
+		return nil, nil, fmt.Errorf("checking out target branch %s: %s", target, string(output))
 	}
 
 	var results []MergeResult
+	var mergedBranches []string
 	for _, wt := range worktrees {
 		if wt.Branch == target {
 			continue
 		}
-		result := mergeBranch(wt, target)
+		result := mergeBranch(absRepo, wt, target)
 		results = append(results, result)
+		if !result.Skipped && result.Error == nil {
+			mergedBranches = append(mergedBranches, wt.Branch)
+		}
 		if result.Error != nil && !result.Skipped {
 			break
 		}
 	}
-	return results, nil
+	return results, mergedBranches, nil
 }
 
-func mergeBranch(wt worktree.Worktree, target string) MergeResult {
+func mergeBranch(repo string, wt worktree.Worktree, target string) MergeResult {
 	result := MergeResult{Branch: wt.Branch}
 
-	cmd := exec.Command("git", "merge", target)
-	cmd.Dir = wt.Path
+	cmd := exec.Command("git", "merge", wt.Branch)
+	cmd.Dir = repo
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if isConflict(output) {
@@ -63,21 +84,25 @@ func mergeBranch(wt worktree.Worktree, target string) MergeResult {
 			action := HandleConflict(wt.Branch)
 			switch action {
 			case ActionOpenVSCode:
-				openEditor("code", wt.Path)
-				waitForResolution(wt.Path)
+				openEditor("code", repo)
+				waitForResolution(repo, wt.Branch, target)
 			case ActionOpenCursor:
-				openEditor("cursor", wt.Path)
-				waitForResolution(wt.Path)
+				openEditor("cursor", repo)
+				waitForResolution(repo, wt.Branch, target)
 			case ActionShowCLI:
-				showCLICommand(target)
-				waitForResolution(wt.Path)
+				showCLICommand(wt.Branch)
+				waitForResolution(repo, wt.Branch, target)
 			case ActionSkip:
 				result.Skipped = true
-				abortMerge(wt.Path)
+				if err := abortMerge(repo); err != nil {
+					fmt.Printf("Warning: failed to abort merge: %v\n", err)
+				}
 				return result
 			case ActionAbortAll:
 				result.Skipped = true
-				abortMerge(wt.Path)
+				if err := abortMerge(repo); err != nil {
+					fmt.Printf("Warning: failed to abort merge: %v\n", err)
+				}
 				result.Error = fmt.Errorf("abort all merges")
 				return result
 			}
@@ -134,41 +159,94 @@ func openEditor(editor, path string) {
 	}
 }
 
-func showCLICommand(target string) {
+func showCLICommand(branch string) {
 	fmt.Printf("\nTo resolve the conflict, run:\n")
-	fmt.Printf("  git merge %s\n", target)
+	fmt.Printf("  git merge %s\n", branch)
 	fmt.Printf("  # resolve conflicts, then:\n")
 	fmt.Printf("  git add .\n")
-	fmt.Printf("  git commit\n\n")
+	fmt.Printf("  git commit -m \"Merge %s\"\n\n", branch)
 }
 
-func waitForResolution(path string) {
+func waitForResolution(path, branch, target string) {
 	fmt.Print("\nPress Enter when conflicts are resolved (or 'a' to abort): ")
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(strings.ToLower(input))
 	if input == "a" {
-		abortMerge(path)
+		if err := abortMerge(path); err != nil {
+			fmt.Printf("Warning: %v\n", err)
+		}
 	} else {
-		commitMerge(path)
+		if err := commitMerge(path, branch, target); err != nil {
+			fmt.Printf("Error committing merge: %v\n", err)
+		}
 	}
 }
 
-func abortMerge(path string) {
+func abortMerge(path string) error {
 	cmd := exec.Command("git", "merge", "--abort")
 	cmd.Dir = path
-	_ = cmd.Run()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git merge --abort failed: %s", string(output))
+	}
+	return nil
 }
 
-func commitMerge(path string) {
+func commitMerge(path, branch, target string) error {
 	cmd := exec.Command("git", "add", ".")
 	cmd.Dir = path
-	_ = cmd.Run()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git add failed: %s", string(output))
+	}
+
+	cmd = exec.Command("git", "commit", "-m", fmt.Sprintf("Merge %s into %s", branch, target))
+	cmd.Dir = path
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git commit failed: %s", string(output))
+	}
+	return nil
 }
 
 type ExfilWarning struct {
 	Branch  string
 	Message string
+}
+
+func storeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = filepath.Join(os.Getenv("HOME"), ".local", "share")
+	}
+	return filepath.Join(home, ".local", "share", "taskforce")
+}
+
+func StoreRecentMerges(branches []string) error {
+	dir := storeDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating store dir: %w", err)
+	}
+	data := []byte(strings.Join(branches, "\n"))
+	path := filepath.Join(dir, "recent-merges.txt")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("writing recent merges: %w", err)
+	}
+	return nil
+}
+
+func LoadRecentMerges() []string {
+	path := filepath.Join(storeDir(), "recent-merges.txt")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return nil
+	}
+	return strings.Split(content, "\n")
 }
 
 func CheckMergeWarning(branch string, recentMerges []string) *ExfilWarning {
