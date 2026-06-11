@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -133,7 +134,7 @@ func Run(repo string) error {
 			if err := writeState(absRepo, state); err != nil {
 				return err
 			}
-			if err := processPending(ctx, absRepo, &wg); err != nil {
+			if err := processPending(ctx, &wg); err != nil {
 				appendDaemonLog(absRepo, "queue error: "+err.Error())
 			}
 			if err := processRunQueue(ctx, absRepo, &wg); err != nil {
@@ -350,7 +351,20 @@ func processAlive(pid int) bool {
 }
 
 func dir(repo string) string {
-	return filepath.Join(repo, ".taskforce")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(repo, ".taskforce")
+	}
+	repoSlug := strings.ReplaceAll(strings.TrimPrefix(repo, "/"), "/", "_")
+	return filepath.Join(home, ".local", "share", "taskforce", "repos", repoSlug)
+}
+
+func reposBase() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "taskforce", "repos")
 }
 
 func statePath(repo string) string {
@@ -389,9 +403,27 @@ func Format(state State, ok bool) string {
 }
 
 // processPending claims queued command jobs and executes each in its own
-// goroutine so long commands do not stall the daemon heartbeat.
-func processPending(ctx context.Context, repo string, wg *sync.WaitGroup) error {
-	paths, err := filepath.Glob(filepath.Join(queueDir(repo), "*.json"))
+// goroutine so long commands do not stall the daemon heartbeat. It scans all
+// tracked repos under the global repos directory.
+func processPending(ctx context.Context, wg *sync.WaitGroup) error {
+	base := reposBase()
+	if base == "" {
+		return nil
+	}
+	repoDirs, err := filepath.Glob(filepath.Join(base, "*"))
+	if err != nil {
+		return err
+	}
+	for _, repoDir := range repoDirs {
+		if err := processRepoPending(ctx, repoDir, wg); err != nil {
+			appendDaemonLog(repoDir, "queue error: "+err.Error())
+		}
+	}
+	return nil
+}
+
+func processRepoPending(ctx context.Context, repoDir string, wg *sync.WaitGroup) error {
+	paths, err := filepath.Glob(filepath.Join(repoDir, "queue", "*.json"))
 	if err != nil {
 		return err
 	}
@@ -414,14 +446,14 @@ func processPending(ctx context.Context, repo string, wg *sync.WaitGroup) error 
 		}
 		job.Status = JobRunning
 		job.StartedAt = time.Now()
-		if err := writeJSONAtomic(jobPath(repo, job.ID), job); err != nil {
+		if err := writeJSONAtomic(filepath.Join(repoDir, "jobs", job.ID+".json"), job); err != nil {
 			return err
 		}
 		_ = os.Remove(claim)
 		wg.Add(1)
 		go func(j Job) {
 			defer wg.Done()
-			executeJob(ctx, repo, j)
+			executeJobInDir(ctx, repoDir, j)
 		}(job)
 	}
 	return nil
@@ -450,6 +482,32 @@ func executeJob(ctx context.Context, repo string, job Job) {
 	}
 	if err := writeJSONAtomic(jobPath(repo, job.ID), job); err != nil {
 		appendDaemonLog(repo, "job write error: "+err.Error())
+	}
+}
+
+func executeJobInDir(ctx context.Context, repoDir string, job Job) {
+	timeout, _ := time.ParseDuration(job.Options.Timeout)
+	r := runner.Runner{Options: runner.Options{
+		Repo:    job.Repo,
+		Shell:   job.Options.Shell,
+		Timeout: timeout,
+		Env:     job.Options.Env,
+		Yes:     job.Options.Yes,
+		Yolo:    job.Options.Yolo,
+		OnOutput: func(name, stream, text string) {
+			_ = appendEventFile(filepath.Join(repoDir, "jobs", job.ID+".jsonl"), JobEvent{JobID: job.ID, Command: name, Stream: stream, Text: text, CreatedAt: time.Now()})
+		},
+	}}
+	result := r.Run(ctx, job.Spec)
+	job.Result = &result
+	job.EndedAt = time.Now()
+	if result.ExitCode == 0 {
+		job.Status = JobPassed
+	} else {
+		job.Status = JobFailed
+	}
+	if err := writeJSONAtomic(filepath.Join(repoDir, "jobs", job.ID+".json"), job); err != nil {
+		appendDaemonLog(repoDir, "job write error: "+err.Error())
 	}
 }
 

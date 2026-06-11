@@ -21,7 +21,7 @@ func TestSubmitProcessPendingWritesResultAndEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	if err := processPending(context.Background(), repo, &wg); err != nil {
+	if err := processPending(context.Background(), &wg); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
