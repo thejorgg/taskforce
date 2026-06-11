@@ -4,33 +4,46 @@
       "enabled": false
     }
   },
+  "agents": {
+    "mytool": {
+      "plan": {
+        "argv": ["mytool", "plan", "--prompt", "{{prompt}}"]
+      },
+      "build": {
+        "argv": ["mytool", "apply", "--prompt", "{{prompt}}", "--model", "{{model}}"]
+      },
+      "env": {
+        "MYTOOL_REPO": "{{repo}}"
+      },
+      "timeout": "20m"
+    }
+  },
   "relay": {
     "control": {
       "agent": "codex",
+      "model": "",
       "prompt": "Inspect the task and produce an implementation plan."
     },
     "build": {
       "agent": "opencode",
+      "model": "",
       "prompt": "Implement the approved plan and report changed files."
     }
   },
   "scope": {
-    "hooks": [
-      {
-        "name": "lint",
-        "run": "npm run lint"
-      },
-      {
-        "name": "tests",
-        "run": "npm test"
-      }
-    ]
+    "hooks": []
   },
   "exfil": {
     "branch": "taskforce/{{task_id}}",
     "commit": true,
     "push": false,
-    "pr": false
+    "pr": false,
+    "hooks": [
+      {
+        "name": "notify",
+        "run": "echo 'release complete'",
+        "work_dir": "{{repo}}"
+      }
+    ]
   }
 }
-

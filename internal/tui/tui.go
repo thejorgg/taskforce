@@ -1,15 +1,22 @@
+// Package tui renders the TaskForce operator dashboard: live pipeline runs,
+// per-stage spy views, run history, settings, and release-gate approvals.
 package tui
 
 import (
-	"fmt"
+	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/thejorgg/taskforce/internal/config"
+	"github.com/thejorgg/taskforce/internal/daemon"
 	"github.com/thejorgg/taskforce/internal/domain"
+	"github.com/thejorgg/taskforce/internal/workspace"
 )
 
 type viewName string
@@ -20,98 +27,163 @@ const (
 	viewRelay    viewName = "relay"
 	viewScope    viewName = "scope"
 	viewExfil    viewName = "exfil"
+	viewRuns     viewName = "runs"
+	viewSettings viewName = "settings"
 )
 
+// appVersion mirrors the CLI version string in cmd/taskforce.
+const appVersion = "v0.3"
+
+var viewCycle = []viewName{viewFeed, viewDispatch, viewRelay, viewScope, viewExfil, viewRuns, viewSettings}
+
 type Model struct {
-	run        domain.PipelineRun
+	repo       string
 	view       viewName
-	cmdMode    bool
+	relayPane  int
 	cmdBuffer  string
 	cmdStatus  string
-	ctrlCArmed bool
-	dead       bool
+	quitPrompt bool
 	main       viewport.Model
 	width      int
 	height     int
 	operator   string
 	started    time.Time
+
+	// static is true when showing one finished run with no daemon polling.
+	static bool
+
+	run         domain.PipelineRun
+	record      *daemon.RunRecord
+	activeRunID string
+	runs        []daemon.RunRecord // newest first
+	runsSel     int
+	events      []daemon.JobEvent
+
+	daemonState daemon.State
+	daemonOK    bool
+
+	cfg      config.Config
+	cfgPaths config.Paths
+	cfgErr   error
 }
 
+type tickMsg time.Time
+
+const refreshInterval = 300 * time.Millisecond
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// New shows a single finished pipeline run as a static result view.
 func New(run domain.PipelineRun) Model {
 	if len(run.Stages) == 0 {
 		run.Stages = idleStages()
 	}
-	m := Model{
-		run:      run,
-		view:     viewFeed,
-		main:     viewport.New(100, 18),
-		operator: operatorName(),
-		started:  time.Now(),
-	}
+	m := baseModel(run.Repo)
+	m.static = true
+	m.run = run
 	m.syncMain()
 	return m
 }
 
+// NewIdle opens the live dashboard against the repo's daemon state.
 func NewIdle(repo string) Model {
-	now := time.Now()
-	return New(domain.PipelineRun{
-		ID:        "session-restored",
-		Repo:      repo,
-		StartedAt: now,
-		Stages:    idleStages(),
-	})
+	m := baseModel(repo)
+	m.refresh()
+	return m
+}
+
+// NewRun opens the live dashboard focused on one daemon-owned run.
+func NewRun(repo, id string) Model {
+	m := baseModel(repo)
+	m.activeRunID = id
+	m.refresh()
+	return m
+}
+
+func baseModel(repo string) Model {
+	return Model{
+		repo:     repo,
+		view:     viewFeed,
+		main:     viewport.New(100, 18),
+		operator: operatorName(),
+		started:  time.Now(),
+		run: domain.PipelineRun{
+			Repo:      repo,
+			StartedAt: time.Now(),
+			Stages:    idleStages(),
+		},
+	}
 }
 
 func Show(run domain.PipelineRun) error {
-	_, err := tea.NewProgram(New(run), tea.WithAltScreen()).Run()
-	return err
+	return runProgram(New(run))
 }
 
 func ShowIdle(repo string) error {
-	_, err := tea.NewProgram(NewIdle(repo), tea.WithAltScreen()).Run()
+	return runProgram(NewIdle(repo))
+}
+
+func ShowRun(repo, id string) error {
+	return runProgram(NewRun(repo, id))
+}
+
+func runProgram(m Model) error {
+	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	return err
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	if m.static {
+		return nil
+	}
+	return tickCmd()
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
 	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = max(80, msg.Width)
-		m.height = max(24, msg.Height)
-		m.resize()
-		m.syncMain()
-	case tea.KeyMsg:
-		key := msg.String()
-		if m.dead {
-			if key == "enter" {
-				m.dead = false
-				m.ctrlCArmed = false
-				m.view = viewFeed
-				m.appendFeed("system", "session reopened · operator "+m.operator+" · state restored")
-			}
+	case tickMsg:
+		if m.static {
 			return m, nil
 		}
-		if m.cmdMode {
-			return m.updateCommand(key, msg)
+		m.refresh()
+		return m, tickCmd()
+	case tea.WindowSizeMsg:
+		m.width = maxInt(40, msg.Width)
+		m.height = maxInt(10, msg.Height)
+		m.resize()
+		m.syncMain()
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+	case tea.KeyMsg:
+		key := msg.String()
+		if m.quitPrompt {
+			return m.updateQuitPrompt(key)
 		}
 		switch key {
 		case "ctrl+c":
-			if m.ctrlCArmed {
-				m.dead = true
+			m.quitPrompt = true
+			return m, nil
+		case "esc":
+			m.setView(viewFeed)
+		case "enter":
+			if m.cmdBuffer == "" && m.view == viewRuns {
+				m.focusSelectedRun()
 				return m, nil
 			}
-			m.ctrlCArmed = true
-			m.cmdStatus = "interrupt received · ctrl-c again to quit"
-		case "esc":
-			m.view = viewFeed
-			m.ctrlCArmed = false
-			m.syncMain()
-		case "ctrl+x", ":":
-			m.cmdMode = true
-			m.cmdStatus = ""
+			m.dispatchCommand(m.cmdBuffer)
 			m.cmdBuffer = ""
+		case "backspace":
+			if len(m.cmdBuffer) > 0 {
+				m.cmdBuffer = m.cmdBuffer[:len(m.cmdBuffer)-1]
+			}
+		case "tab":
+			m.cycleView(1)
+		case "shift+tab":
+			m.cycleView(-1)
+		case "ctrl+p":
+			m.setView(viewSettings)
 		case "ctrl+d":
 			m.setView(viewDispatch)
 		case "ctrl+r":
@@ -120,114 +192,273 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setView(viewScope)
 		case "ctrl+e":
 			m.setView(viewExfil)
+		case "ctrl+o":
+			m.setView(viewRuns)
 		case "ctrl+a":
-			if m.view == viewExfil {
-				m.appendFeed("exfil", "approval recorded · push/pr handoff would run when configured")
-				m.cmdStatus = "approved tf-0139"
-			}
+			m.decide(true)
 		case "ctrl+z":
-			if m.view == viewExfil {
-				m.appendFeed("exfil", "denied · handoff requeued to relay")
-				m.cmdStatus = "denied tf-0139"
+			m.decide(false)
+		case "left":
+			if m.view == viewRelay {
+				m.moveRelayPane(-1)
 			}
-		case "ctrl+j", "down", "j":
-			m.main.LineDown(1)
-		case "ctrl+k", "up", "k":
-			m.main.LineUp(1)
-		case "ctrl+u", "pgup", "u":
+		case "right":
+			if m.view == viewRelay {
+				m.moveRelayPane(1)
+			}
+		case "up", "ctrl+k":
+			if m.view == viewRelay {
+				m.moveRelayPane(-1)
+			} else if m.view == viewRuns {
+				m.moveRunsSelection(-1)
+			} else {
+				m.main.LineUp(1)
+			}
+		case "down", "ctrl+j":
+			if m.view == viewRelay {
+				m.moveRelayPane(1)
+			} else if m.view == viewRuns {
+				m.moveRunsSelection(1)
+			} else {
+				m.main.LineDown(1)
+			}
+		case "pgup", "ctrl+u":
 			m.main.HalfViewUp()
-		case "ctrl+n", "pgdown", "d":
+		case "pgdown", "ctrl+n":
 			m.main.HalfViewDown()
-		}
-	}
-	m.main, cmd = m.main.Update(msg)
-	return m, cmd
-}
-
-func (m Model) updateCommand(key string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch key {
-	case "ctrl+c":
-		if m.ctrlCArmed {
-			m.dead = true
-			return m, nil
-		}
-		m.ctrlCArmed = true
-		m.cmdStatus = "interrupt received · ctrl-c again to quit"
-	case "esc":
-		m.cmdMode = false
-		m.cmdBuffer = ""
-	case "enter":
-		m.runCommand(m.cmdBuffer)
-		m.cmdMode = false
-		m.cmdBuffer = ""
-	case "backspace":
-		if len(m.cmdBuffer) > 0 {
-			m.cmdBuffer = m.cmdBuffer[:len(m.cmdBuffer)-1]
-		}
-	default:
-		if len(msg.Runes) > 0 {
-			m.cmdBuffer += string(msg.Runes)
+		case "home":
+			m.main.GotoTop()
+		case "end":
+			m.main.GotoBottom()
+		default:
+			if len(msg.Runes) > 0 {
+				text := commandTextFromRunes(msg.Runes)
+				if text != "" {
+					m.cmdStatus = ""
+					m.cmdBuffer += text
+				}
+			}
 		}
 	}
 	return m, nil
 }
 
-func (m *Model) runCommand(raw string) {
+// refresh pulls daemon, config, and run state from disk; the daemon owns all
+// pipeline execution so the TUI is a pure observer plus command submitter.
+func (m *Model) refresh() {
+	if m.static {
+		return
+	}
+	state, ok, err := daemon.Status(m.repo)
+	m.daemonState = state
+	m.daemonOK = err == nil && ok && state.Status == "running"
+	m.cfg, m.cfgPaths, m.cfgErr = config.LoadEffective(m.repo, "")
+	if runs, err := daemon.ListRuns(m.repo, 50); err == nil {
+		for i, j := 0, len(runs)-1; i < j; i, j = i+1, j-1 {
+			runs[i], runs[j] = runs[j], runs[i]
+		}
+		m.runs = runs
+	}
+	if m.runsSel >= len(m.runs) {
+		m.runsSel = maxInt(0, len(m.runs)-1)
+	}
+	if m.activeRunID == "" && len(m.runs) > 0 && m.runs[0].Status.Active() {
+		m.activeRunID = m.runs[0].ID
+	}
+	if m.activeRunID != "" {
+		if record, found, err := daemon.ReadRun(m.repo, m.activeRunID); err == nil && found {
+			m.record = &record
+			if len(record.Run.Stages) > 0 {
+				m.run = record.Run
+			}
+			if events, err := daemon.ReadRunEvents(m.repo, m.activeRunID); err == nil {
+				m.events = events
+			}
+		}
+	}
+	m.syncMain()
+}
+
+func (m *Model) dispatchCommand(raw string) {
 	cmd := strings.TrimSpace(raw)
 	if cmd == "" {
 		return
 	}
-	m.appendFeed("cmd", cmd)
-	fields := strings.Fields(strings.ToLower(cmd))
-	verb := fields[0]
-	arg := ""
-	if len(fields) > 1 {
-		arg = fields[1]
+	if m.view == viewSettings && m.dispatchSettingsCommand(cmd) {
+		m.syncMain()
+		return
 	}
-	switch verb {
-	case "help":
-		m.appendFeed("system", "commands: help · status · check <agent> · approve <id> · deny <id> · clear · version · whoami · quit")
-	case "status":
-		for _, stage := range m.run.Stages {
-			m.appendFeed("system", fmt.Sprintf("%-9s %s · %s", strings.ToLower(string(stage.Name)), stage.Status, firstLog(stage)))
+	if m.handleSwitchCommand(cmd) {
+		return
+	}
+	if m.static {
+		m.cmdStatus = "static result view · run `taskforce run` to dispatch"
+		return
+	}
+	if _, err := daemon.Start(m.repo); err != nil {
+		m.cmdStatus = "daemon: " + err.Error()
+		return
+	}
+	record, err := daemon.SubmitRun(m.repo, daemon.JobOptions{}, "tui", cmd)
+	if err != nil {
+		m.cmdStatus = err.Error()
+		return
+	}
+	m.activeRunID = record.ID
+	m.record = &record
+	m.events = nil
+	m.run = domain.PipelineRun{ID: record.ID, Repo: m.repo, StartedAt: time.Now(), Stages: idleStages()}
+	m.cmdStatus = "dispatched " + record.ID
+	m.setView(viewFeed)
+}
+
+func (m *Model) handleSwitchCommand(cmd string) bool {
+	parts := strings.Fields(cmd)
+	if len(parts) < 2 {
+		return false
+	}
+	if parts[0] != "switch" && parts[0] != "cd" {
+		return false
+	}
+	path := strings.Join(parts[1:], " ")
+	path = strings.TrimPrefix(path, "~"+string(filepath.Separator))
+	if strings.HasPrefix(parts[1], "~") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			path = filepath.Join(home, strings.TrimPrefix(parts[1], "~"))
 		}
-	case "check":
-		switch arg {
-		case "dispatch":
-			m.setView(viewDispatch)
-		case "relay":
-			m.setView(viewRelay)
-		case "scope":
-			m.setView(viewScope)
-		case "exfil":
-			m.setView(viewExfil)
-		case "echo":
-			m.appendFeed("system", "echo is ambient · it has no dedicated check view")
-		default:
-			m.appendFeed("system", "usage: check dispatch|relay|scope|exfil")
+	}
+	resolved, err := workspace.Resolve(path)
+	if err != nil {
+		m.cmdStatus = "switch: " + err.Error()
+		return true
+	}
+	m.repo = resolved
+	m.activeRunID = ""
+	m.record = nil
+	m.events = nil
+	m.runs = nil
+	m.run = domain.PipelineRun{Repo: m.repo, StartedAt: time.Now(), Stages: idleStages()}
+	m.cmdStatus = "switched to " + m.repo
+	state, _ := workspace.LoadState()
+	state.ActiveRepo = m.repo
+	_ = workspace.SaveState(state)
+	if _, err := daemon.Start(m.repo); err != nil {
+		m.cmdStatus = "switched to " + m.repo + " · daemon: " + err.Error()
+	}
+	m.setView(viewFeed)
+	return true
+}
+
+func (m *Model) dispatchSettingsCommand(cmd string) bool {
+	parts := strings.Fields(cmd)
+	if len(parts) < 3 {
+		return false
+	}
+	if parts[0] != "set" && parts[0] != "unset" {
+		return false
+	}
+	level := config.Level(parts[1])
+	paths, err := config.DiscoverPaths(m.repo, "")
+	if err != nil {
+		m.cmdStatus = err.Error()
+		return true
+	}
+	target, err := config.PathForLevel(paths, level)
+	if err != nil {
+		m.cmdStatus = err.Error()
+		return true
+	}
+	if parts[0] == "unset" {
+		if err := config.UnsetValue(target, parts[2]); err != nil {
+			m.cmdStatus = err.Error()
+		} else {
+			m.cmdStatus = "unset " + parts[2] + " in " + string(level)
 		}
-	case "dispatch", "relay", "scope", "exfil":
-		m.setView(viewName(verb))
-	case "approve":
-		m.setView(viewExfil)
-		m.cmdStatus = "approved " + valueOr(arg, "tf-0139")
-		m.appendFeed("exfil", m.cmdStatus+" · handoff ready")
-	case "deny":
-		m.setView(viewExfil)
-		m.cmdStatus = "denied " + valueOr(arg, "tf-0139")
-		m.appendFeed("exfil", m.cmdStatus+" · requeued to relay")
-	case "clear":
-		m.main.SetContent("")
-	case "version":
-		m.appendFeed("system", "taskforce v0.1 · go tui · multi-agent orchestration")
-	case "whoami":
-		m.appendFeed("system", m.operator+" · role operator · gates: release/approval")
-	case "quit", "exit":
-		m.dead = true
+		return true
+	}
+	if len(parts) < 4 {
+		m.cmdStatus = "usage: set profile|project|workspace path value"
+		return true
+	}
+	value := strings.TrimSpace(strings.TrimPrefix(cmd, strings.Join(parts[:3], " ")))
+	if err := config.SetValue(target, parts[2], value); err != nil {
+		m.cmdStatus = err.Error()
+	} else {
+		m.cmdStatus = "set " + parts[2] + " in " + string(level)
+	}
+	return true
+}
+
+// decide answers a pending release-gate approval through the daemon.
+func (m *Model) decide(approve bool) {
+	if !m.approvalPending() {
+		m.cmdStatus = "no approval pending"
+		return
+	}
+	var err error
+	if approve {
+		err = daemon.Approve(m.repo, m.record.ID, "tui:"+m.operator)
+	} else {
+		err = daemon.Deny(m.repo, m.record.ID, "tui:"+m.operator)
+	}
+	switch {
+	case err != nil:
+		m.cmdStatus = err.Error()
+	case approve:
+		m.cmdStatus = "approved " + m.record.ID
 	default:
-		m.appendFeed("system", "unknown command "+verb+" · try help")
+		m.cmdStatus = "denied " + m.record.ID
+	}
+}
+
+func (m Model) approvalPending() bool {
+	return m.record != nil && m.record.Status == daemon.RunAwaitingApproval && m.record.Pending != nil
+}
+
+func (m *Model) moveRunsSelection(delta int) {
+	if len(m.runs) == 0 {
+		return
+	}
+	m.runsSel += delta
+	if m.runsSel < 0 {
+		m.runsSel = 0
+	}
+	if m.runsSel >= len(m.runs) {
+		m.runsSel = len(m.runs) - 1
 	}
 	m.syncMain()
+}
+
+func (m *Model) focusSelectedRun() {
+	if m.runsSel < 0 || m.runsSel >= len(m.runs) {
+		return
+	}
+	record := m.runs[m.runsSel]
+	m.activeRunID = record.ID
+	m.record = &record
+	if len(record.Run.Stages) > 0 {
+		m.run = record.Run
+	} else {
+		m.run = domain.PipelineRun{ID: record.ID, Repo: m.repo, Stages: idleStages()}
+	}
+	if events, err := daemon.ReadRunEvents(m.repo, record.ID); err == nil {
+		m.events = events
+	}
+	m.cmdStatus = "focused " + record.ID
+	m.syncMain()
+}
+
+func (m *Model) moveRelayPane(delta int) {
+	m.relayPane += delta
+	if m.relayPane < 0 {
+		m.relayPane = len(relayPaneCommands) - 1
+	}
+	if m.relayPane >= len(relayPaneCommands) {
+		m.relayPane = 0
+	}
+	m.syncMain()
+	m.main.GotoTop()
 }
 
 func (m Model) View() string {
@@ -235,144 +466,135 @@ func (m Model) View() string {
 		m.width = 120
 		m.height = 38
 	}
-	if m.dead {
-		return m.deadView()
+	if m.quitPrompt {
+		return m.quitPromptView()
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.header(),
-		m.agentRail(),
-		m.mainWindow(),
-		m.inputLine(),
-		m.footer(),
+	f := m.frame()
+	m.main.Width = maxInt(30, m.width-4)
+	m.main.Height = f.mainH
+	sections := []string{m.header(f)}
+	if f.railH > 0 {
+		sections = append(sections, m.agentRail(f))
+	}
+	sections = append(sections, m.mainWindow(f))
+	if f.approvalH > 0 {
+		sections = append(sections, m.approvalBar(f))
+	}
+	sections = append(sections, m.inputLine())
+	if len(f.legend.lines) > 0 {
+		sections = append(sections, renderLegend(f.legend, f.legendItems))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+// legendItems lists the bottom key legend; action names feed mouse clicks.
+func (m Model) legendItems() []legendItem {
+	items := []legendItem{}
+	if m.approvalPending() {
+		items = append(items,
+			legendItem{key: "ctrl+a", label: "approve", action: "approve"},
+			legendItem{key: "ctrl+z", label: "deny", action: "deny"},
+		)
+	}
+	items = append(items,
+		legendItem{key: "enter", label: "dispatch", action: ""},
+		legendItem{key: "ctrl+d", label: "dispatch", action: string(viewDispatch)},
+		legendItem{key: "ctrl+r", label: "relay", action: string(viewRelay)},
+		legendItem{key: "ctrl+s", label: "scope", action: string(viewScope)},
+		legendItem{key: "ctrl+e", label: "exfil", action: string(viewExfil)},
+		legendItem{key: "ctrl+o", label: "runs", action: string(viewRuns)},
+		legendItem{key: "ctrl+p", label: "settings", action: string(viewSettings)},
+		legendItem{key: "tab", label: "next view", action: "next"},
+		legendItem{key: "esc", label: "feed", action: string(viewFeed)},
+		legendItem{key: "↑/↓", label: "scroll", action: ""},
+		legendItem{key: "ctrl+c", label: "shutdown", action: "quit"},
 	)
+	return items
 }
 
-func (m Model) header() string {
-	right := time.Now().UTC().Format("15:04:05z") + " · operator: " + m.operator
-	notif := "0 notifications · all gates clear"
-	if exfilStatus(m.run.Stages) != domain.StatusPassed {
-		notif = "▲ 1 notification · exfil tf-0139 pending approval · press ctrl+e to review"
+func (m Model) updateQuitPrompt(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "y", "Y", "s", "S", "ctrl+c":
+		m.cmdStatus = "stopping local agents"
+		return m, stopLocalAgentsAndQuit(m.repo)
+	case "n", "N", "k", "K", "enter":
+		m.cmdStatus = "keeping local daemon running"
+		return m, tea.Quit
+	case "esc":
+		m.quitPrompt = false
+		m.cmdStatus = "shutdown cancelled"
+		return m, nil
+	default:
+		return m, nil
 	}
-	content := strings.Join([]string{
-		bright.Render("welcome back, "+m.operator) + dim.Render(" — session restored · /var/lib/taskforce/state.db · uplink ok"),
-		warn.Render(notif),
-		dim.Render("pipeline echo → dispatch → relay → scope → exfil · " + fmt.Sprintf("%d/%d stages up", activeCount(m.run.Stages), len(m.run.Stages))),
-	}, "\n")
-	return box("taskforce v0.1", right, content, m.width, toneBase)
 }
 
-func (m Model) agentRail() string {
-	names := []domain.StageName{domain.StageEcho, domain.StageDispatch, domain.StageRelay, domain.StageScope, domain.StageExfil}
-	width := max(12, m.width/len(names))
-	cards := make([]string, 0, len(names))
-	for _, name := range names {
-		stage := stageByName(m.run.Stages, name)
-		cards = append(cards, m.agentCard(stage, width))
+func stopLocalAgentsAndQuit(repo string) tea.Cmd {
+	return func() tea.Msg {
+		_ = daemon.Stop(repo)
+		return tea.Quit()
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, cards...)
 }
 
-func (m Model) agentCard(stage domain.StageSnapshot, width int) string {
-	key := stageKey(stage.Name)
-	right := key
-	if key != "" {
-		right = strings.TrimPrefix(key, "ctrl+")
-	}
-	tone := toneBase
-	if viewForStage(stage.Name) == m.view {
-		tone = toneAccent
-	}
-	if stage.Status == domain.StatusNeedsRevision || stage.Status == domain.StatusFailed {
-		tone = toneErr
-	}
-	if stage.Name == domain.StageExfil && stage.Status != domain.StatusPassed {
-		tone = toneWarn
-	}
-	hint := "ambient"
-	if key != "" {
-		hint = strings.TrimPrefix(key, "ctrl+") + " to check"
-	}
-	body := strings.Join([]string{
-		stageStateLine(stage),
-		sparkline(stage.Status, max(4, width-4)),
-		dim.Render(hint),
-	}, "\n")
-	return box(strings.ToLower(string(stage.Name)), right, body, width, tone)
-}
-
-func (m Model) mainWindow() string {
-	title, right := "taskforce · live feed", "streaming"
-	tone := toneBase
-	if m.view != viewFeed {
-		title = string(m.view) + " · " + viewTitle(m.view)
-		right = "esc to return"
-		tone = toneAccent
-	}
-	if m.view == viewExfil {
-		tone = toneWarn
-	}
-	mainHeight := max(8, m.height-16)
-	m.main.Width = max(30, m.width-4)
-	m.main.Height = mainHeight
-	return box(title, right, m.main.View(), m.width, tone)
-}
-
-func (m Model) inputLine() string {
-	prompt := dim.Render("❯ press ctrl+x or : to type a command · try help, status, approve tf-0139")
-	if m.cmdStatus != "" {
-		prompt = warn.Render(m.cmdStatus)
-	}
-	if m.cmdMode {
-		prompt = accent.Render("❯ ") + bright.Render(m.cmdBuffer) + dim.Render("█")
-	}
-	tone := toneBase
-	if m.cmdMode {
-		tone = toneAccent
-	}
-	return box("command", "", prompt, m.width, tone)
-}
-
-func (m Model) footer() string {
-	if m.ctrlCArmed {
-		return errStyle.Render("interrupt received · ctrl-c again to quit")
-	}
-	return dim.Render("ctrl-c twice to quit · ctrl+d dispatch · ctrl+r relay · ctrl+s scope · ctrl+e exfil · esc feed · ctrl+x command")
-}
-
-func (m Model) deadView() string {
+func (m Model) quitPromptView() string {
 	lines := []string{
-		"^C",
-		"taskforce: received interrupt · draining workers",
-		"relay: build terminated · control checkpoint saved",
-		"scope: hooks cancelled · cache flushed",
-		"system: session closed · state persisted → /var/lib/taskforce/state.db",
+		"taskforce shutdown",
 		"",
-		"[process exited 0]",
+		"Stop local agents?",
 		"",
-		"enter to reconnect█",
+		"[y] stop local agents and quit",
+		"[n] keep local daemon running and quit",
+		"[enter] keep daemon",
+		"[esc] cancel",
+		"",
+		dim.Render("ctrl-c stops local agents and quits"),
 	}
 	return lipgloss.NewStyle().
 		Width(m.width).
 		Height(m.height).
-		Padding(max(1, m.height/3), max(2, m.width/10)).
+		Padding(maxInt(1, m.height/3), maxInt(2, m.width/10)).
 		Foreground(cDim).
 		Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) setView(view viewName) {
-	if view == viewFeed || view == viewDispatch || view == viewRelay || view == viewScope || view == viewExfil {
-		m.view = view
-		m.ctrlCArmed = false
-		m.syncMain()
+	for _, candidate := range viewCycle {
+		if candidate == view {
+			m.view = view
+			m.syncMain()
+			if view == viewFeed {
+				m.main.GotoBottom()
+			} else {
+				m.main.GotoTop()
+			}
+			return
+		}
 	}
 }
 
-func (m *Model) resize() {
-	m.main.Width = max(30, m.width-4)
-	m.main.Height = max(8, m.height-16)
+func (m *Model) cycleView(delta int) {
+	current := 0
+	for i, candidate := range viewCycle {
+		if candidate == m.view {
+			current = i
+			break
+		}
+	}
+	next := (current + delta + len(viewCycle)) % len(viewCycle)
+	m.setView(viewCycle[next])
 }
 
+func (m *Model) resize() {
+	f := m.frame()
+	m.main.Width = maxInt(30, m.width-4)
+	m.main.Height = f.mainH
+}
+
+// syncMain refreshes the spy viewport content while preserving the operator's
+// scroll position; the feed sticks to the bottom when it was already there.
 func (m *Model) syncMain() {
+	atBottom := m.main.AtBottom()
+	offset := m.main.YOffset
 	switch m.view {
 	case viewDispatch:
 		m.main.SetContent(m.dispatchView())
@@ -382,331 +604,54 @@ func (m *Model) syncMain() {
 		m.main.SetContent(m.scopeView())
 	case viewExfil:
 		m.main.SetContent(m.exfilView())
+	case viewSettings:
+		m.main.SetContent(m.settingsView())
+	case viewRuns:
+		m.main.SetContent(m.runsView())
 	default:
 		m.main.SetContent(m.feedView())
-		m.main.GotoBottom()
-		return
-	}
-	m.main.GotoTop()
-}
-
-func (m Model) feedView() string {
-	lines := []string{
-		feedLine("system", "session opened · tty terminal · taskforce v0.1"),
-		feedLine("system", "config loaded · taskforce.json · 5 stages · hooks ready"),
-	}
-	for _, stage := range m.run.Stages {
-		for _, log := range stage.Logs {
-			for _, line := range strings.Split(strings.TrimRight(log, "\n"), "\n") {
-				if strings.TrimSpace(line) != "" {
-					lines = append(lines, feedLine(strings.ToLower(string(stage.Name)), line))
-				}
-			}
+		if atBottom {
+			m.main.GotoBottom()
+		} else {
+			m.main.SetYOffset(offset)
 		}
-	}
-	if len(lines) < 9 {
-		lines = append(lines,
-			feedLine("echo", "watching configured sources · github:issues · slack:#eng-incidents · local:stdin"),
-			feedLine("dispatch", "queue idle · dedupe index warm · classifier ready"),
-			feedLine("relay", "control idle · build workers available"),
-			feedLine("scope", "hooks idle · waiting for relay output"),
-			feedLine("exfil", "release gate idle · approval required when configured"),
-		)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m Model) dispatchView() string {
-	taskID := valueOr(m.run.Task.ID, "tf-0139")
-	category := valueOr(m.run.Task.Category, "bugfix")
-	return strings.Join([]string{
-		rule("queue"),
-		"id        kind      scope             pri  state        age",
-		fmt.Sprintf("%-9s %-9s %-17s p%-3d %-12s %s", taskID, category, "relay/client", max(1, m.run.Task.Priority/20), "forwarded", "00m38s"),
-		"tf-0141   bugfix    scope/hooks       p2   queued       00m09s",
-		dim.Render("depth 1 · dedupe index 412 signals · classifier configured · est 1.2k tok/packet"),
-		"",
-		rule("recent activity"),
-		agentTail(m.run.Stages, domain.StageDispatch, "dispatch idle · no task packet queued"),
-	}, "\n")
-}
-
-func (m Model) relayView() string {
-	running := stageByName(m.run.Stages, domain.StageRelay).Status == domain.StatusRunning
-	state := "idle"
-	if running {
-		state = "active"
-	}
-	return strings.Join([]string{
-		rule("workers"),
-		"worker     role      state      detail",
-		fmt.Sprintf("control    planner   %-9s plan/execute loop · checkpoint 38s ago", state),
-		"build-1    builder   idle       configured agent or command hook",
-		"build-2    builder   idle       test/build executor · last exit unknown",
-		"",
-		rule("recent activity"),
-		agentTail(m.run.Stages, domain.StageRelay, "relay idle · control/build waiting"),
-	}, "\n")
-}
-
-func (m Model) scopeView() string {
-	return strings.Join([]string{
-		rule("review hooks · tf-0139"),
-		"hook                      result    detail",
-		"go test ./...              hold      waiting for relay output",
-		"configured lint            hold      command from taskforce.json",
-		"visual review              hold      operator or agent review",
-		"",
-		rule("approval rules"),
-		"scope/clean        auto-approve when configured hooks pass",
-		"release/approval   operator required before exfil push/pr",
-		"",
-		rule("recent activity"),
-		agentTail(m.run.Stages, domain.StageScope, "scope idle · no hooks running"),
-	}, "\n")
-}
-
-func (m Model) exfilView() string {
-	taskID := valueOr(m.run.Task.ID, "tf-0139")
-	title := valueOr(m.run.Task.Title, "pending handoff")
-	branch := valueOr(m.run.Release.Branch, "taskforce/"+taskID)
-	return strings.Join([]string{
-		rule("handoff " + taskID),
-		"title     " + title,
-		"branch    " + branch + " → main",
-		"diff      pending relay output",
-		warn.Render("status    ◆ holding at gate release/approval — operator decision required"),
-		"",
-		rule("commits"),
-		"pending   commit will be created by configured Exfil policy",
-		"",
-		accent.Render("[ ctrl+a ] approve · push + open pr") + "    " + errStyle.Render("[ ctrl+z ] deny · requeue to relay"),
-		"",
-		rule("recent activity"),
-		agentTail(m.run.Stages, domain.StageExfil, "exfil idle · no approved handoff pending"),
-	}, "\n")
-}
-
-func (m *Model) appendFeed(source, text string) {
-	if strings.TrimSpace(text) == "" {
 		return
 	}
-	if m.view == viewFeed {
-		current := m.main.View()
-		m.main.SetContent(current + "\n" + feedLine(source, text))
-		m.main.GotoBottom()
-		return
-	}
-	stageName := domain.StageName(strings.Title(source))
-	for i := range m.run.Stages {
-		if m.run.Stages[i].Name == stageName {
-			m.run.Stages[i].Logs = append(m.run.Stages[i].Logs, text)
-			return
-		}
-	}
+	m.main.SetYOffset(offset)
 }
 
 func idleStages() []domain.StageSnapshot {
 	return []domain.StageSnapshot{
-		{Name: domain.StageEcho, Status: domain.StatusRunning, Logs: []string{"watching 0 sources · no active task"}},
-		{Name: domain.StageDispatch, Status: domain.StatusPending, Logs: []string{"idle · no task packet queued"}},
-		{Name: domain.StageRelay, Status: domain.StatusPending, Logs: []string{"idle · control/build waiting"}},
-		{Name: domain.StageScope, Status: domain.StatusPending, Logs: []string{"idle · no hooks running"}},
-		{Name: domain.StageExfil, Status: domain.StatusSkipped, Logs: []string{"no approved handoff pending"}},
+		{Name: domain.StageEcho, Status: domain.StatusRunning, Logs: []string{"watching operator input · no active task"}},
+		{Name: domain.StageDispatch, Status: domain.StatusIdle, Logs: []string{"idle · no task packet queued"}},
+		{Name: domain.StageRelay, Status: domain.StatusIdle, Logs: []string{"idle · control/build waiting"}},
+		{Name: domain.StageScope, Status: domain.StatusIdle, Logs: []string{"idle · no hooks running"}},
+		{Name: domain.StageExfil, Status: domain.StatusSkipped, Logs: []string{"no approved handoff yet"}},
 	}
 }
 
-func box(title, right, content string, width int, tone lipgloss.Color) string {
-	width = max(8, width)
-	inner := max(1, width-4)
-	border := lipgloss.NewStyle().Foreground(tone)
-	top := []rune("┌" + strings.Repeat("─", width-2) + "┐")
-	writeAt(top, 2, " "+title+" ")
-	if right != "" && width > lipgloss.Width(right)+lipgloss.Width(title)+4 {
-		writeAt(top, width-lipgloss.Width(right)-3, " "+right+" ")
-	}
-	out := []string{border.Render(string(top))}
-	for _, raw := range strings.Split(content, "\n") {
-		wrapped := lipgloss.NewStyle().Width(inner).MaxWidth(inner).Render(raw)
-		for _, line := range strings.Split(wrapped, "\n") {
-			out = append(out, border.Render("│")+" "+padCell(line, inner)+" "+border.Render("│"))
-		}
-	}
-	out = append(out, border.Render("└"+strings.Repeat("─", width-2)+"┘"))
-	return strings.Join(out, "\n")
-}
-
-func writeAt(line []rune, pos int, text string) {
-	for i, r := range []rune(text) {
-		if pos+i >= 0 && pos+i < len(line) {
-			line[pos+i] = r
-		}
-	}
-}
-
-func padCell(line string, width int) string {
-	cellWidth := lipgloss.Width(line)
-	if cellWidth > width {
-		return truncateCell(line, width)
-	}
-	return line + strings.Repeat(" ", width-cellWidth)
-}
-
-func truncateCell(line string, width int) string {
-	if width <= 0 {
+func commandTextFromRunes(runes []rune) string {
+	text := string(runes)
+	if looksLikeMouseEscape(text) {
 		return ""
 	}
-	var out strings.Builder
-	for _, r := range line {
-		next := out.String() + string(r)
-		if lipgloss.Width(next) > width {
-			break
+	out := strings.Builder{}
+	for _, r := range runes {
+		if r == '\n' || r == '\r' || r == '\t' {
+			continue
 		}
-		out.WriteRune(r)
-	}
-	return padCell(out.String(), width)
-}
-
-func stageStateLine(stage domain.StageSnapshot) string {
-	symbol := "○"
-	switch stage.Status {
-	case domain.StatusRunning:
-		symbol = "●"
-	case domain.StatusPassed:
-		symbol = "✓"
-	case domain.StatusNeedsRevision:
-		symbol = "◆"
-	case domain.StatusFailed:
-		symbol = "✕"
-	case domain.StatusSkipped:
-		symbol = "○"
-	}
-	return statusStyle(stage.Status).Render(symbol + " " + strings.ReplaceAll(string(stage.Status), "_", " "))
-}
-
-func sparkline(status domain.StageStatus, width int) string {
-	pattern := "▁▁▂▁▁▂▁▁▂▁"
-	switch status {
-	case domain.StatusRunning:
-		pattern = "▁▂▃▄▅▆▅▄▃▂"
-	case domain.StatusPassed:
-		pattern = "▂▄▅▇▆▅▇▆▄▂"
-	case domain.StatusNeedsRevision, domain.StatusFailed:
-		pattern = "▅▂▇▁▆▂▇▁▅▂"
-	case domain.StatusSkipped:
-		pattern = "▂▂▂▁▁▂▂▂▁▁"
-	}
-	repeated := strings.Repeat(pattern, width/10+2)
-	return sparkStyle(status).Render(takeRunes(repeated, width))
-}
-
-func feedLine(source, text string) string {
-	return fmt.Sprintf("%s %-8s %s", time.Now().Format("15:04:05"), source, text)
-}
-
-func rule(label string) string {
-	return dim.Render("── " + label + " " + strings.Repeat("─", 64))
-}
-
-func agentTail(stages []domain.StageSnapshot, name domain.StageName, fallback string) string {
-	stage := stageByName(stages, name)
-	if len(stage.Logs) == 0 {
-		return fallback
-	}
-	lines := []string{}
-	for _, log := range stage.Logs {
-		for _, line := range strings.Split(strings.TrimRight(log, "\n"), "\n") {
-			if strings.TrimSpace(line) != "" {
-				lines = append(lines, feedLine(strings.ToLower(string(name)), line))
-			}
+		if unicode.IsPrint(r) && !unicode.IsControl(r) {
+			out.WriteRune(r)
 		}
 	}
-	if len(lines) == 0 {
-		return fallback
-	}
-	return strings.Join(lines, "\n")
+	return out.String()
 }
 
-func stageByName(stages []domain.StageSnapshot, name domain.StageName) domain.StageSnapshot {
-	for _, stage := range stages {
-		if stage.Name == name {
-			return stage
-		}
+func looksLikeMouseEscape(text string) bool {
+	if strings.Contains(text, "\x1b[<") {
+		return true
 	}
-	return domain.StageSnapshot{Name: name, Status: domain.StatusPending}
-}
-
-func viewForStage(name domain.StageName) viewName {
-	switch name {
-	case domain.StageDispatch:
-		return viewDispatch
-	case domain.StageRelay:
-		return viewRelay
-	case domain.StageScope:
-		return viewScope
-	case domain.StageExfil:
-		return viewExfil
-	default:
-		return viewFeed
-	}
-}
-
-func stageKey(name domain.StageName) string {
-	switch name {
-	case domain.StageDispatch:
-		return "ctrl+d"
-	case domain.StageRelay:
-		return "ctrl+r"
-	case domain.StageScope:
-		return "ctrl+s"
-	case domain.StageExfil:
-		return "ctrl+e"
-	default:
-		return ""
-	}
-}
-
-func viewTitle(view viewName) string {
-	switch view {
-	case viewDispatch:
-		return "task packets"
-	case viewRelay:
-		return "implementation loop"
-	case viewScope:
-		return "validation gates"
-	case viewExfil:
-		return "release gate"
-	default:
-		return "live feed"
-	}
-}
-
-func exfilStatus(stages []domain.StageSnapshot) domain.StageStatus {
-	return stageByName(stages, domain.StageExfil).Status
-}
-
-func firstLog(stage domain.StageSnapshot) string {
-	if len(stage.Logs) == 0 {
-		return "no output"
-	}
-	return strings.TrimSpace(stage.Logs[len(stage.Logs)-1])
-}
-
-func activeCount(stages []domain.StageSnapshot) int {
-	count := 0
-	for _, stage := range stages {
-		if stage.Status == domain.StatusPassed || stage.Status == domain.StatusRunning {
-			count++
-		}
-	}
-	return count
-}
-
-func valueOr(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
+	return strings.Contains(text, "[<") && strings.ContainsAny(text, "Mm")
 }
 
 func operatorName() string {
@@ -715,70 +660,4 @@ func operatorName() string {
 		return parts[len(parts)-1]
 	}
 	return "operator"
-}
-
-func takeRunes(value string, width int) string {
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
-	}
-	return string(runes[:width])
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-var (
-	cDim    = lipgloss.Color("60")
-	cText   = lipgloss.Color("109")
-	cBright = lipgloss.Color("254")
-	cAcc    = lipgloss.Color("74")
-	cOk     = lipgloss.Color("72")
-	cWarn   = lipgloss.Color("179")
-	cErr    = lipgloss.Color("167")
-
-	toneBase   = lipgloss.Color("24")
-	toneAccent = cAcc
-	toneWarn   = cWarn
-	toneErr    = cErr
-
-	dim      = lipgloss.NewStyle().Foreground(cDim)
-	bright   = lipgloss.NewStyle().Foreground(cBright).Bold(true)
-	accent   = lipgloss.NewStyle().Foreground(cAcc)
-	warn     = lipgloss.NewStyle().Foreground(cWarn)
-	errStyle = lipgloss.NewStyle().Foreground(cErr)
-)
-
-func statusStyle(status domain.StageStatus) lipgloss.Style {
-	switch status {
-	case domain.StatusPassed:
-		return lipgloss.NewStyle().Foreground(cOk)
-	case domain.StatusFailed, domain.StatusNeedsRevision:
-		return lipgloss.NewStyle().Foreground(cErr)
-	case domain.StatusRunning:
-		return lipgloss.NewStyle().Foreground(cText)
-	case domain.StatusSkipped:
-		return lipgloss.NewStyle().Foreground(cWarn)
-	default:
-		return lipgloss.NewStyle().Foreground(cDim)
-	}
-}
-
-func sparkStyle(status domain.StageStatus) lipgloss.Style {
-	switch status {
-	case domain.StatusRunning:
-		return lipgloss.NewStyle().Foreground(cAcc)
-	case domain.StatusPassed:
-		return lipgloss.NewStyle().Foreground(cOk)
-	case domain.StatusNeedsRevision, domain.StatusFailed:
-		return lipgloss.NewStyle().Foreground(cErr)
-	case domain.StatusSkipped:
-		return lipgloss.NewStyle().Foreground(cWarn)
-	default:
-		return lipgloss.NewStyle().Foreground(cDim)
-	}
 }

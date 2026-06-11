@@ -15,7 +15,7 @@ const (
 type StageStatus string
 
 const (
-	StatusPending       StageStatus = "pending"
+	StatusIdle          StageStatus = "idle"
 	StatusRunning       StageStatus = "running"
 	StatusPassed        StageStatus = "passed"
 	StatusFailed        StageStatus = "failed"
@@ -127,9 +127,15 @@ type ReleaseResult struct {
 }
 
 type StageSnapshot struct {
-	Name   StageName   `json:"name"`
-	Status StageStatus `json:"status"`
-	Logs   []string    `json:"logs,omitempty"`
+	Name       StageName   `json:"name"`
+	Status     StageStatus `json:"status"`
+	Logs       []string    `json:"logs,omitempty"`
+	LogEntries []StageLog  `json:"log_entries,omitempty"`
+}
+
+type StageLog struct {
+	CreatedAt time.Time `json:"created_at"`
+	Text      string    `json:"text"`
 }
 
 type PipelineRun struct {

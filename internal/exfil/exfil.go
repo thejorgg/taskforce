@@ -32,7 +32,7 @@ func (r Releaser) Release(ctx context.Context, task domain.TaskPacket, review do
 		}
 	}
 	for _, hook := range r.Config.Hooks {
-		res := r.Runner.Run(ctx, domain.CommandSpec{Name: "exfil." + hook.Name, Run: hook.Run, Argv: hook.Argv, Env: hook.Env, Timeout: hook.Timeout, Mutates: true, Required: hook.Required})
+		res := r.Runner.Run(ctx, domain.CommandSpec{Name: "exfil." + hook.Name, Run: hook.Run, Argv: hook.Argv, Env: hook.Env, WorkDir: hook.WorkDir, Timeout: hook.Timeout, Mutates: true, Required: hook.Required})
 		out.Results = append(out.Results, res)
 		if hook.Required && res.ExitCode != 0 {
 			out.Skipped = true

@@ -17,6 +17,9 @@ func (r Reviewer) Review(ctx context.Context, task domain.TaskPacket, relay doma
 	if relay.BuildResult != nil && relay.BuildResult.ExitCode != 0 {
 		return domain.ReviewResult{Status: domain.ReviewNeedsRevision, Reason: "Relay Build failed.", Feedback: []string{relay.BuildResult.Output()}}
 	}
+	if len(r.Config.Hooks) == 0 {
+		return domain.ReviewResult{Status: domain.ReviewApproved, Reason: "No Scope hooks configured."}
+	}
 	results := make([]domain.CommandResult, 0, len(r.Config.Hooks))
 	for _, hook := range r.Config.Hooks {
 		spec := domain.CommandSpec{
@@ -24,6 +27,7 @@ func (r Reviewer) Review(ctx context.Context, task domain.TaskPacket, relay doma
 			Run:      hook.Run,
 			Argv:     hook.Argv,
 			Env:      hook.Env,
+			WorkDir:  hook.WorkDir,
 			Timeout:  hook.Timeout,
 			Required: hook.Required,
 			Mutates:  false,
