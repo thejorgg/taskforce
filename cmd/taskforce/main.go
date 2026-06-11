@@ -64,6 +64,8 @@ func run(args []string) error {
 		return switchCmd(args[1:])
 	case "agents":
 		return agentsCmd(args[1:])
+	case "worktree":
+		return worktreeCmd(args[1:])
 	case "doctor":
 		return doctorCmd(args[1:])
 	case "version", "--version", "-v":
@@ -124,7 +126,7 @@ func daemonCmd(args []string) error {
 		}
 		fmt.Println(daemon.Format(state, true))
 	case "status":
-		state, ok, err := daemon.Status(absRepo)
+		state, ok, err := daemon.Status()
 		if err != nil {
 			return err
 		}
@@ -256,6 +258,7 @@ Usage:
   taskforce doctor                           check config, tools, and daemon health
   taskforce init [--level profile|project|workspace]
   taskforce config check|show|set|unset ...
+  taskforce worktree add|list|remove [--repo PATH]
   taskforce daemon start|status|stop [--repo PATH]
   taskforce version`)
 }
