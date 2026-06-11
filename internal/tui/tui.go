@@ -3,9 +3,12 @@
 package tui
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -65,6 +68,54 @@ type Model struct {
 	cfg      config.Config
 	cfgPaths config.Paths
 	cfgErr   error
+
+	// init wizard state
+	initWizard bool
+	initStep   int
+	initData   initData
+
+	// settings interactive state
+	settingsSel          int
+	settingsDropdownOpen int // -1 = none, index into settingsRows
+	settingsDropdownCur  int // selected option within open dropdown
+
+	// file modal state
+	fileModal     *fileOpenModal
+	lastClickX    int
+	lastClickY    int
+	lastClickPath string
+	lastClickTime time.Time
+
+	// hit-map for rendered settings rows and artifact rows
+	settingsRows []settingsRow
+	artifactRows []artifactHit
+}
+
+type initData struct {
+	controlAgent string
+	buildAgent   string
+	controlModel string
+	buildModel   string
+	exfilBranch  string
+	exfilCommit  bool
+}
+
+type fileOpenModal struct {
+	path   string
+	editor string
+}
+
+type settingsRow struct {
+	label    string
+	dotted   string
+	value    string
+	options  []string
+	editable bool
+}
+
+type artifactHit struct {
+	path string
+	line int
 }
 
 type tickMsg time.Time
@@ -104,11 +155,12 @@ func NewRun(repo, id string) Model {
 
 func baseModel(repo string) Model {
 	return Model{
-		repo:     repo,
-		view:     viewFeed,
-		main:     viewport.New(100, 18),
-		operator: operatorName(),
-		started:  time.Now(),
+		repo:                 repo,
+		view:                 viewFeed,
+		main:                 viewport.New(100, 18),
+		operator:             operatorName(),
+		started:              time.Now(),
+		settingsDropdownOpen: -1,
 		run: domain.PipelineRun{
 			Repo:      repo,
 			StartedAt: time.Now(),
@@ -149,6 +201,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refresh()
 		return m, tickCmd()
+	case editorResult:
+		if m.fileModal != nil {
+			if msg.err != nil {
+				m.cmdStatus = "editor: " + msg.err.Error()
+			} else {
+				m.cmdStatus = "opened " + m.fileModal.path
+			}
+			m.fileModal = nil
+			m.syncMain()
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = maxInt(40, msg.Width)
 		m.height = maxInt(10, msg.Height)
@@ -160,6 +223,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		key := msg.String()
 		if m.quitPrompt {
 			return m.updateQuitPrompt(key)
+		}
+		if m.initWizard {
+			return m.updateInitWizard(key)
+		}
+		if m.fileModal != nil {
+			return m, m.updateFileModal(key)
+		}
+		if m.view == viewSettings && m.settingsDropdownOpen >= 0 {
+			m.updateSettingsDropdown(key)
+			return m, nil
+		}
+		if m.view == viewSettings {
+			if m.updateSettingsNav(key) {
+				return m, nil
+			}
 		}
 		switch key {
 		case "ctrl+c":
@@ -284,11 +362,19 @@ func (m *Model) dispatchCommand(raw string) {
 	if cmd == "" {
 		return
 	}
-	if m.view == viewSettings && m.dispatchSettingsCommand(cmd) {
-		m.syncMain()
+	if m.handleSlashCommand(cmd) {
 		return
 	}
 	if m.handleSwitchCommand(cmd) {
+		return
+	}
+	if m.view == viewSettings {
+		if m.dispatchSettingsCommand(cmd) {
+			m.syncMain()
+			return
+		}
+		m.cmdStatus = "command blocked in settings · set/unset to edit · esc to return"
+		m.syncMain()
 		return
 	}
 	if m.static {
@@ -350,6 +436,30 @@ func (m *Model) handleSwitchCommand(cmd string) bool {
 	return true
 }
 
+func (m *Model) handleSlashCommand(cmd string) bool {
+	if !strings.HasPrefix(cmd, "/") {
+		return false
+	}
+	switch cmd {
+	case "/settings":
+		m.setView(viewSettings)
+		return true
+	case "/history":
+		m.setView(viewRuns)
+		return true
+	case "/init":
+		m.initWizard = true
+		m.initStep = 0
+		m.initData = initData{}
+		m.cmdStatus = ""
+		m.syncMain()
+		return true
+	default:
+		m.cmdStatus = "unknown command: " + cmd
+		return true
+	}
+}
+
 func (m *Model) dispatchSettingsCommand(cmd string) bool {
 	parts := strings.Fields(cmd)
 	if len(parts) < 3 {
@@ -388,6 +498,278 @@ func (m *Model) dispatchSettingsCommand(cmd string) bool {
 		m.cmdStatus = "set " + parts[2] + " in " + string(level)
 	}
 	return true
+}
+
+func (m *Model) updateInitWizard(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc":
+		m.initWizard = false
+		m.initStep = 0
+		m.cmdStatus = "init cancelled"
+		m.syncMain()
+		return m, nil
+	case "enter":
+		cmd := strings.TrimSpace(m.cmdBuffer)
+		m.cmdBuffer = ""
+		m.cmdStatus = ""
+		switch m.initStep {
+		case 0:
+			m.initData.controlAgent = resolveAgentChoice(cmd, "codex")
+			m.initStep = 1
+		case 1:
+			m.initData.controlModel = cmd
+			m.initStep = 2
+		case 2:
+			m.initData.buildAgent = resolveAgentChoice(cmd, "opencode")
+			m.initStep = 3
+		case 3:
+			m.initData.buildModel = cmd
+			m.initStep = 4
+		case 4:
+			if cmd == "" {
+				m.initData.exfilBranch = "taskforce/{{task_id}}"
+			} else {
+				m.initData.exfilBranch = cmd
+			}
+			m.initData.exfilCommit = true
+			m.completeInitWizard()
+			return m, nil
+		}
+		m.syncMain()
+		return m, nil
+	case "backspace":
+		if len(m.cmdBuffer) > 0 {
+			m.cmdBuffer = m.cmdBuffer[:len(m.cmdBuffer)-1]
+		}
+	default:
+		runes := []rune(key)
+		if len(runes) == 1 && runes[0] >= 32 {
+			m.cmdBuffer += key
+		}
+	}
+	return m, nil
+}
+
+func resolveAgentChoice(input, fallback string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return fallback
+	}
+	switch input {
+	case "1", "codex":
+		return "codex"
+	case "2", "opencode":
+		return "opencode"
+	case "3", "claude":
+		return "claude"
+	case "4", "mimo":
+		return "mimo"
+	default:
+		return input
+	}
+}
+
+func (m *Model) completeInitWizard() {
+	data := m.initData
+	cfg := config.Default()
+	cfg.Relay.Control.Agent = data.controlAgent
+	cfg.Relay.Control.Model = data.controlModel
+	cfg.Relay.Build.Agent = data.buildAgent
+	cfg.Relay.Build.Model = data.buildModel
+	cfg.Exfil.Branch = data.exfilBranch
+	cfg.Exfil.Commit = data.exfilCommit
+
+	paths, err := config.DiscoverPaths(m.repo, "")
+	if err != nil {
+		m.cmdStatus = "init: " + err.Error()
+		m.initWizard = false
+		m.syncMain()
+		return
+	}
+	if err := config.WriteDefault(paths.Project); err != nil {
+		m.cmdStatus = "init: " + err.Error()
+		m.initWizard = false
+		m.syncMain()
+		return
+	}
+
+	agentsMD := `# Agents
+
+## Control Agent
+- Agent: ` + data.controlAgent + `
+- Model: ` + valueOr(data.controlModel, "default") + `
+- Role: Plans implementation approach
+
+## Build Agent
+- Agent: ` + data.buildAgent + `
+- Model: ` + valueOr(data.buildModel, "default") + `
+- Role: Implements approved plans
+`
+	agentsPath := filepath.Join(m.repo, "AGENTS.md")
+	if err := os.WriteFile(agentsPath, []byte(agentsMD), 0o644); err != nil {
+		m.cmdStatus = "init: wrote config but failed to write AGENTS.md: " + err.Error()
+	} else {
+		m.cmdStatus = "init complete · taskforce.json + AGENTS.md created"
+	}
+	m.initWizard = false
+	m.initStep = 0
+	m.refresh()
+	m.syncMain()
+}
+
+func (m *Model) updateSettingsNav(key string) bool {
+	rows := m.buildSettingsRows()
+	switch key {
+	case "up", "ctrl+k":
+		if m.settingsSel > 0 {
+			m.settingsSel--
+		}
+		m.syncMain()
+		return true
+	case "down", "ctrl+j":
+		if m.settingsSel < len(rows)-1 {
+			m.settingsSel++
+		}
+		m.syncMain()
+		return true
+	case "enter":
+		if m.settingsSel >= 0 && m.settingsSel < len(rows) {
+			row := rows[m.settingsSel]
+			if row.editable && len(row.options) > 0 {
+				m.settingsDropdownOpen = m.settingsSel
+				m.settingsDropdownCur = 0
+				m.syncMain()
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *Model) updateSettingsDropdown(key string) {
+	rows := m.buildSettingsRows()
+	if m.settingsDropdownOpen < 0 || m.settingsDropdownOpen >= len(rows) {
+		m.settingsDropdownOpen = -1
+		m.syncMain()
+		return
+	}
+	row := rows[m.settingsDropdownOpen]
+	switch key {
+	case "esc":
+		m.settingsDropdownOpen = -1
+		m.syncMain()
+		return
+	case "up", "ctrl+k":
+		if m.settingsDropdownCur > 0 {
+			m.settingsDropdownCur--
+		}
+		m.syncMain()
+		return
+	case "down", "ctrl+j":
+		if m.settingsDropdownCur < len(row.options)-1 {
+			m.settingsDropdownCur++
+		}
+		m.syncMain()
+		return
+	case "enter":
+		choice := row.options[m.settingsDropdownCur]
+		m.applySettingsChoice(row, choice)
+		m.settingsDropdownOpen = -1
+		m.refresh()
+		m.syncMain()
+		return
+	}
+}
+
+func (m *Model) applySettingsChoice(row settingsRow, choice string) {
+	paths, err := config.DiscoverPaths(m.repo, "")
+	if err != nil {
+		m.cmdStatus = err.Error()
+		return
+	}
+	level := config.LevelWorkspace
+	if row.dotted == "config.level" {
+		return
+	}
+	target, err := config.PathForLevel(paths, level)
+	if err != nil {
+		m.cmdStatus = err.Error()
+		return
+	}
+	if choice == "true" || choice == "false" {
+		if err := config.SetValue(target, row.dotted, choice); err != nil {
+			m.cmdStatus = err.Error()
+		} else {
+			m.cmdStatus = "set " + row.dotted + " = " + choice
+		}
+	} else {
+		if err := config.SetValue(target, row.dotted, choice); err != nil {
+			m.cmdStatus = err.Error()
+		} else {
+			m.cmdStatus = "set " + row.dotted + " = " + choice
+		}
+	}
+}
+
+func (m *Model) updateFileModal(key string) tea.Cmd {
+	switch key {
+	case "enter":
+		editor := m.fileModal.editor
+		path := m.fileModal.path
+		m.fileModal = nil
+		m.syncMain()
+		if editor == "" {
+			m.cmdStatus = "no $EDITOR set · set VISUAL or EDITOR environment variable"
+			return nil
+		}
+		m.cmdStatus = "opening " + path + " with " + editor
+		return openEditorCmd(editor, path)
+	case "esc":
+		m.fileModal = nil
+		m.syncMain()
+		return nil
+	}
+	return nil
+}
+
+func (m *Model) buildSettingsRows() []settingsRow {
+	rows := []settingsRow{}
+	if m.cfgErr != nil {
+		return rows
+	}
+	cfg := m.cfg
+	rows = append(rows,
+		settingsRow{label: "control agent", dotted: "relay.control.agent", value: valueOr(cfg.Relay.Control.Agent, "codex"), options: []string{"codex", "opencode", "claude", "mimo"}, editable: true},
+		settingsRow{label: "control model", dotted: "relay.control.model", value: valueOr(cfg.Relay.Control.Model, "default"), options: nil, editable: false},
+		settingsRow{label: "build agent", dotted: "relay.build.agent", value: valueOr(cfg.Relay.Build.Agent, "opencode"), options: []string{"codex", "opencode", "claude", "mimo"}, editable: true},
+		settingsRow{label: "build model", dotted: "relay.build.model", value: valueOr(cfg.Relay.Build.Model, "default"), options: nil, editable: false},
+		settingsRow{label: "exfil.commit", dotted: "exfil.commit", value: fmt.Sprintf("%v", cfg.Exfil.Commit), options: []string{"true", "false"}, editable: true},
+		settingsRow{label: "exfil.push", dotted: "exfil.push", value: fmt.Sprintf("%v", cfg.Exfil.Push), options: []string{"true", "false"}, editable: true},
+		settingsRow{label: "exfil.pr", dotted: "exfil.pr", value: fmt.Sprintf("%v", cfg.Exfil.PR), options: []string{"true", "false"}, editable: true},
+		settingsRow{label: "rescue.enabled", dotted: "rescue.enabled", value: fmt.Sprintf("%v", cfg.Rescue.Enabled), options: []string{"true", "false"}, editable: true},
+		settingsRow{label: "profile path", dotted: "", value: valueOr(m.cfgPaths.Profile, "unavailable"), options: nil, editable: false},
+		settingsRow{label: "project path", dotted: "", value: valueOr(m.cfgPaths.Project, "unavailable"), options: nil, editable: false},
+		settingsRow{label: "workspace path", dotted: "", value: valueOr(m.cfgPaths.Workspace, "unavailable"), options: nil, editable: false},
+	)
+	return rows
+}
+
+func (m *Model) artifacts() []string {
+	seen := map[string]bool{}
+	var arts []string
+	for _, a := range m.run.Signal.Artifacts {
+		if !seen[a] {
+			seen[a] = true
+			arts = append(arts, a)
+		}
+	}
+	for _, a := range m.run.Task.RelevantArtifacts {
+		if !seen[a] {
+			seen[a] = true
+			arts = append(arts, a)
+		}
+	}
+	return arts
 }
 
 // decide answers a pending release-gate approval through the daemon.
@@ -469,6 +851,9 @@ func (m Model) View() string {
 	if m.quitPrompt {
 		return m.quitPromptView()
 	}
+	if m.fileModal != nil {
+		return m.fileModalView()
+	}
 	f := m.frame()
 	m.main.Width = maxInt(30, m.width-4)
 	m.main.Height = f.mainH
@@ -485,6 +870,35 @@ func (m Model) View() string {
 		sections = append(sections, renderLegend(f.legend, f.legendItems))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m Model) fileModalView() string {
+	editor := m.fileModal.editor
+	if editor == "" {
+		editor = "(none set)"
+	}
+	editorLine := "[enter] open with " + editor
+	if m.fileModal.editor == "" {
+		editorLine = "[enter] no $EDITOR set · set VISUAL or EDITOR"
+	}
+	lines := []string{
+		"",
+		bright.Render("  open file"),
+		"",
+		"  " + m.fileModal.path,
+		"",
+		"  editor: " + dim.Render(editor),
+		"",
+		"  " + editorLine,
+		"  " + dim.Render("[esc] cancel"),
+		"",
+	}
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Padding(maxInt(1, m.height/3), maxInt(2, m.width/10)).
+		Foreground(cDim).
+		Render(strings.Join(lines, "\n"))
 }
 
 // legendItems lists the bottom key legend; action names feed mouse clicks.
@@ -560,6 +974,11 @@ func (m Model) quitPromptView() string {
 func (m *Model) setView(view viewName) {
 	for _, candidate := range viewCycle {
 		if candidate == view {
+			if m.view == viewSettings && view != viewSettings {
+				m.settingsSel = 0
+				m.settingsDropdownOpen = -1
+				m.settingsDropdownCur = 0
+			}
 			m.view = view
 			m.syncMain()
 			if view == viewFeed {
@@ -595,6 +1014,11 @@ func (m *Model) resize() {
 func (m *Model) syncMain() {
 	atBottom := m.main.AtBottom()
 	offset := m.main.YOffset
+	if m.initWizard {
+		m.main.SetContent(m.initWizardView())
+		m.main.SetYOffset(offset)
+		return
+	}
 	switch m.view {
 	case viewDispatch:
 		m.main.SetContent(m.dispatchView())
@@ -605,7 +1029,8 @@ func (m *Model) syncMain() {
 	case viewExfil:
 		m.main.SetContent(m.exfilView())
 	case viewSettings:
-		m.main.SetContent(m.settingsView())
+		m.buildSettingsHitMap()
+		m.main.SetContent(m.settingsViewContent())
 	case viewRuns:
 		m.main.SetContent(m.runsView())
 	default:
@@ -618,6 +1043,25 @@ func (m *Model) syncMain() {
 		return
 	}
 	m.main.SetYOffset(offset)
+}
+
+func (m *Model) buildSettingsHitMap() {
+	m.settingsRows = m.buildSettingsRows()
+	m.artifactRows = nil
+	arts := m.artifacts()
+	if len(arts) == 0 {
+		return
+	}
+	content := m.settingsViewContent()
+	rowLines := strings.Split(content, "\n")
+	for i, line := range rowLines {
+		trimmed := strings.TrimSpace(line)
+		for _, a := range arts {
+			if trimmed == a || strings.HasSuffix(trimmed, a) {
+				m.artifactRows = append(m.artifactRows, artifactHit{path: a, line: i})
+			}
+		}
+	}
 }
 
 func idleStages() []domain.StageSnapshot {
@@ -660,4 +1104,60 @@ func operatorName() string {
 		return parts[len(parts)-1]
 	}
 	return "operator"
+}
+
+func editorCmd() string {
+	if v := os.Getenv("VISUAL"); v != "" {
+		return v
+	}
+	if e := os.Getenv("EDITOR"); e != "" {
+		return e
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return "open"
+	case "windows":
+		return "notepad"
+	default:
+		if p, err := exec.LookPath("xdg-open"); err == nil {
+			return p
+		}
+		return ""
+	}
+}
+
+func openEditorCmd(editor, filePath string) tea.Cmd {
+	return func() tea.Msg {
+		parts := strings.Fields(editor)
+		if len(parts) == 0 {
+			return editorResult{err: fmt.Errorf("no $EDITOR set")}
+		}
+		parts = append(parts, filePath)
+		cmd := exec.Command(parts[0], parts[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		return editorResult{err: err}
+	}
+}
+
+type editorResult struct {
+	err error
+}
+
+func safeArtifactPath(repo, raw string) (string, bool) {
+	if raw == "" {
+		return "", false
+	}
+	if filepath.IsAbs(raw) {
+		return raw, true
+	}
+	abs := filepath.Join(repo, raw)
+	abs = filepath.Clean(abs)
+	root := filepath.Clean(repo)
+	if !strings.HasPrefix(abs, root+string(filepath.Separator)) && abs != root {
+		return "", false
+	}
+	return abs, true
 }

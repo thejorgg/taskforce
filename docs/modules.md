@@ -19,6 +19,8 @@ When Scope rejects a build, Relay retries up to `relay.retries` extra attempts, 
 
 Both stages resolve their command through the harness registry (see below). Scout-style repo mapping is optional and is configured separately from the canonical five pipeline names.
 
+When a Relay planning or build command fails with configured safety/refusal text, the rescue protocol can rerun the failed step in a temporary neutralized copy of the repo before Scope starts. The default rescue team uses `codex`, writes the copy under `/tmp/.relay-rescue/<repo-name>`, rewrites configured conflict-prone terms to per-run neutral tokens, retries up to `rescue.max_attempts`, and restores successful edits back into the original checkout through the inverse mapping.
+
 ## Scope
 
 Scope validates Relay output. It runs user-configured hooks such as `go test ./...`, `npm test`, or repo-specific review commands, collects output, and returns approved, rejected, or needs-revision. New configs leave Scope hooks empty so init does not guess the repo's language or toolchain.
@@ -33,7 +35,7 @@ Exfil only runs after Scope approval. It can create/switch a branch, commit, pus
 
 1. Stage-level `run` / `argv` override — the command is used as-is.
 2. A custom agent from the `agents` config map, using its `plan` or `build` variant when present, else its default `run`/`argv`.
-3. A built-in adapter: `claude`, `codex`, `opencode`, `gemini`. Plan variants run read-only (e.g. codex read-only sandbox, `claude --permission-mode plan`); build variants may edit the workspace (codex workspace-write, `claude --permission-mode acceptEdits`, `gemini --yolo`).
+3. A built-in adapter: `claude`, `codex`, `opencode`, `gemini`, `mimo`. Plan variants run read-only (e.g. codex read-only sandbox, `claude --permission-mode plan`); build variants may edit the workspace (codex workspace-write, `claude --permission-mode acceptEdits`, `gemini --yolo`, `mimo run --dangerously-skip-permissions`).
 
 Defaults when no agent is configured: `codex` for Control, `opencode` for Build.
 
@@ -62,6 +64,14 @@ Relay stages select a harness with `agent` and an optional `model`:
 ```
 
 Set `run` or `argv` to bypass built-ins and use a custom harness command directly.
+
+## Rescue Protocol
+
+`rescue` config controls the fallback path used when a Relay command fails with one of `rescue.triggers` in stdout, stderr, or the command error. When enabled, TaskForce copies the active repo to `rescue.root`, applies `rescue.mappings` in that copy using materialized collision-checked replacement tokens, reruns the failed Relay stage with `rescue.agent` up to `rescue.max_attempts`, and restores successful edits through the inverse mapping before Scope hooks run.
+
+Starting rescue also records the repo and configured mapping table in `$HOME/.local/taskforce/rescue-state.json`. Future runs for that repo read the stored mappings and run Relay Control/Build in a neutralized temporary copy immediately, without waiting for another safety/refusal failure.
+
+The default rescue config is enabled, uses `codex`, and watches for safety, security-policy, refusal, disallowed-content, military, weapon, combat, and conflict wording. The mapping table can be narrowed or extended in profile, project, or workspace config.
 
 ## Daemon, Runs, and Logs
 

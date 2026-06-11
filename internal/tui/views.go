@@ -127,6 +127,28 @@ func (m Model) approvalBar(f frame) string {
 
 func (m Model) inputLine() string {
 	avail := maxInt(8, m.width-8)
+	if m.initWizard {
+		prompt := accent.Render("❯ ") + dim.Render("enter value · esc to cancel")
+		if m.cmdBuffer != "" {
+			visible := m.cmdBuffer
+			if runes := []rune(visible); len(runes) > avail {
+				visible = string(runes[len(runes)-avail:])
+			}
+			prompt = accent.Render("❯ ") + bright.Render(visible) + dim.Render("█")
+		}
+		return box("init wizard", fmt.Sprintf("step %d/5", m.initStep+1), prompt, m.width, toneAccent)
+	}
+	if m.view == viewSettings {
+		blocked := errStyle.Render("X") + dim.Render(" esc to return · set/unset to edit config")
+		if m.cmdBuffer != "" {
+			visible := m.cmdBuffer
+			if runes := []rune(visible); len(runes) > avail {
+				visible = string(runes[len(runes)-avail:])
+			}
+			blocked = errStyle.Render("X") + " " + bright.Render(visible)
+		}
+		return box("command", "blocked", blocked, m.width, toneErr)
+	}
 	prompt := accent.Render("❯ ") + dim.Render(takeRunes("type a task for the pipeline · enter to dispatch", avail))
 	if m.cmdStatus != "" {
 		prompt = warn.Render(takeRunes(m.cmdStatus, avail+4))
@@ -427,26 +449,47 @@ func (m Model) exfilView() string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) settingsView() string {
-	active := "config unavailable: " + errText(m.cfgErr)
-	if m.cfgErr == nil {
-		active = fmt.Sprintf("control=%s model=%s · build=%s model=%s",
+func (m Model) settingsViewContent() string {
+	rows := m.settingsRows
+	lines := []string{rule("settings")}
+	if m.cfgErr != nil {
+		lines = append(lines, errStyle.Render("config unavailable: "+m.cfgErr.Error()))
+	} else {
+		active := fmt.Sprintf("control=%s model=%s · build=%s model=%s",
 			stageAgentLabel(m.cfg.Relay.Control, "codex"), valueOr(m.cfg.Relay.Control.Model, "default"),
 			stageAgentLabel(m.cfg.Relay.Build, "opencode"), valueOr(m.cfg.Relay.Build.Model, "default"))
+		lines = append(lines, active)
 	}
-	lines := []string{
-		rule("settings"),
-		active,
-		"profile             " + valueOr(m.cfgPaths.Profile, "unavailable"),
-		"project             " + valueOr(m.cfgPaths.Project, "unavailable"),
-		"workspace           " + valueOr(m.cfgPaths.Workspace, "unavailable"),
+	for i, row := range rows {
+		marker := "  "
+		style := dim.Render
+		if i == m.settingsSel {
+			marker = accent.Render("▸ ")
+			style = bright.Render
+		}
+		valueText := row.value
+		if row.editable && len(row.options) > 0 {
+			valueText += dim.Render("  ↵")
+		}
+		lines = append(lines, fmt.Sprintf("%s%-20s %s", marker, style(row.label), valueText))
+		if m.settingsDropdownOpen == i {
+			for j, opt := range row.options {
+				optMarker := "    "
+				optStyle := dim.Render
+				if j == m.settingsDropdownCur {
+					optMarker = accent.Render("  ▸ ")
+					optStyle = bright.Render
+				}
+				lines = append(lines, optMarker+optStyle(opt))
+			}
+		}
 	}
 	if m.cfgErr == nil && len(m.cfg.Agents) > 0 {
 		names := make([]string, 0, len(m.cfg.Agents))
 		for name := range m.cfg.Agents {
 			names = append(names, name)
 		}
-		lines = append(lines, "agents              "+strings.Join(names, ", "))
+		lines = append(lines, "", "agents              "+strings.Join(names, ", "))
 	}
 	lines = append(lines,
 		"",
@@ -455,8 +498,19 @@ func (m Model) settingsView() string {
 		"set profile relay.build.model openai/gpt-5",
 		`set workspace relay.build.argv ["opencode","run","{{prompt}}"]`,
 		"unset workspace relay.build.argv",
+	)
+	arts := m.artifacts()
+	if len(arts) > 0 {
+		lines = append(lines, "", rule("artifacts"))
+		for _, a := range arts {
+			lines = append(lines, dim.Render("  "+a))
+		}
+		lines = append(lines, "", dim.Render("double-click an artifact to open with $EDITOR"))
+	}
+	lines = append(lines,
 		"",
 		rule("keys"),
+		"↑/↓ navigate · enter opens dropdown · esc close",
 		"ctrl+p settings     ctrl+d dispatch     ctrl+r relay",
 		"ctrl+s scope        ctrl+e exfil        ctrl+o runs",
 		"tab next view       esc feed            ctrl+c shutdown",
@@ -493,6 +547,56 @@ func (m Model) runsView() string {
 		lines = append(lines, row)
 	}
 	lines = append(lines, "", dim.Render("↑/↓ select · enter or click focus · esc back"))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) initWizardView() string {
+	lines := []string{rule("init wizard · step " + fmt.Sprint(m.initStep+1) + "/5")}
+	switch m.initStep {
+	case 0:
+		lines = append(lines, "",
+			"control agent (planner):",
+			"",
+			dim.Render("  [1] codex   [2] opencode   [3] claude   [4] mimo"),
+			"",
+			"type the number or agent name, then press enter",
+		)
+	case 1:
+		lines = append(lines, "",
+			"control model (leave empty for default):",
+			"",
+			dim.Render("  examples: openai/gpt-5, anthropic/claude-4, mimo/mimo-v2.5-pro"),
+			"",
+			"type the model name or press enter for default",
+		)
+	case 2:
+		lines = append(lines, "",
+			"build agent (coder):",
+			"",
+			dim.Render("  [1] opencode   [2] codex   [3] claude   [4] mimo"),
+			"",
+			"type the number or agent name, then press enter",
+		)
+	case 3:
+		lines = append(lines, "",
+			"build model (leave empty for default):",
+			"",
+			dim.Render("  examples: openai/gpt-5, anthropic/claude-4, mimo/mimo-v2.5-pro"),
+			"",
+			"type the model name or press enter for default",
+		)
+	case 4:
+		lines = append(lines, "",
+			"exfil branch pattern (leave empty for default):",
+			"",
+			dim.Render("  default: taskforce/{{task_id}}"),
+			"",
+			"type the branch pattern or press enter for default",
+		)
+	}
+	if m.cmdStatus != "" {
+		lines = append(lines, "", warn.Render(m.cmdStatus))
+	}
 	return strings.Join(lines, "\n")
 }
 

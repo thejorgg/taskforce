@@ -355,3 +355,182 @@ func TestSwitchNoArgDoesNothing(t *testing.T) {
 		t.Fatal("repo should not have changed for bare switch")
 	}
 }
+
+func TestSettingsLegendClickOpensSettings(t *testing.T) {
+	m := newTestModel(t, 120, 40)
+	f := m.frame()
+	var target legendSpan
+	found := false
+	for _, span := range f.legend.spans {
+		if span.item.action == string(viewSettings) {
+			target = span
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("settings legend span not found")
+	}
+	m = updateTestModel(t, m, tea.MouseMsg{
+		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		X: target.x0, Y: f.legendY + target.line,
+	})
+	if m.view != viewSettings {
+		t.Fatalf("view = %s, want settings", m.view)
+	}
+}
+
+func TestSettingsUpDownSelectsRows(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewSettings)
+	m.syncMain()
+	if m.settingsSel != 0 {
+		t.Fatalf("initial settingsSel = %d, want 0", m.settingsSel)
+	}
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.settingsSel != 1 {
+		t.Fatalf("settingsSel after down = %d, want 1", m.settingsSel)
+	}
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	if m.settingsSel != 0 {
+		t.Fatalf("settingsSel after up = %d, want 0", m.settingsSel)
+	}
+}
+
+func TestSettingsEnterOpensDropdown(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewSettings)
+	m.syncMain()
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.settingsDropdownOpen != 0 {
+		t.Fatalf("dropdownOpen = %d, want 0", m.settingsDropdownOpen)
+	}
+	view := m.main.View()
+	if !strings.Contains(view, "codex") || !strings.Contains(view, "opencode") {
+		t.Fatalf("dropdown options missing from view: %q", view)
+	}
+}
+
+func TestSettingsDropdownEscCloses(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewSettings)
+	m.syncMain()
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.settingsDropdownOpen < 0 {
+		t.Fatal("dropdown did not open")
+	}
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.settingsDropdownOpen >= 0 {
+		t.Fatalf("dropdownOpen = %d after esc, want -1", m.settingsDropdownOpen)
+	}
+}
+
+func TestSettingsDropdownDownSelectsOption(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewSettings)
+	m.syncMain()
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.settingsDropdownCur != 1 {
+		t.Fatalf("dropdownCur = %d, want 1", m.settingsDropdownCur)
+	}
+}
+
+func TestCommandBufferPreservedAcrossSettings(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("fix login")})
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	if m.view != viewSettings {
+		t.Fatalf("view = %s, want settings", m.view)
+	}
+	if m.cmdBuffer != "fix login" {
+		t.Fatalf("cmdBuffer = %q, want 'fix login'", m.cmdBuffer)
+	}
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.cmdBuffer != "fix login" {
+		t.Fatalf("cmdBuffer after nav = %q, want 'fix login'", m.cmdBuffer)
+	}
+}
+
+func TestSettingsEscReturnsToFeed(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.setView(viewSettings)
+	m.syncMain()
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.view != viewFeed {
+		t.Fatalf("view after esc = %s, want feed", m.view)
+	}
+	if m.settingsDropdownOpen != -1 {
+		t.Fatalf("dropdownOpen = %d, want -1", m.settingsDropdownOpen)
+	}
+}
+
+func TestDoubleClickArtifactOpensModal(t *testing.T) {
+	m := newTestModel(t, 120, 40)
+	m.run.Signal.Artifacts = []string{"src/main.go"}
+	m.setView(viewSettings)
+	m.syncMain()
+	f := m.frame()
+	if len(m.artifactRows) == 0 {
+		t.Fatal("no artifact rows rendered")
+	}
+	hit := m.artifactRows[0]
+	screenY := f.mainY + 1 + hit.line - m.main.YOffset
+	m = updateTestModel(t, m, tea.MouseMsg{
+		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		X: 4, Y: screenY,
+	})
+	if m.fileModal != nil {
+		t.Fatal("single click should not open modal")
+	}
+	m = updateTestModel(t, m, tea.MouseMsg{
+		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		X: 4, Y: screenY,
+	})
+	if m.fileModal == nil {
+		t.Fatal("double click should open modal")
+	}
+}
+
+func TestFileModalEnterLaunchesEditor(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.fileModal = &fileOpenModal{path: "/tmp/test.go", editor: "cat"}
+	updated, cmd := updateTestModelWithCmd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected editor command")
+	}
+	if updated.fileModal != nil {
+		t.Fatal("modal should be cleared after enter")
+	}
+}
+
+func TestFileModalEscCloses(t *testing.T) {
+	m := newTestModel(t, 100, 30)
+	m.fileModal = &fileOpenModal{path: "/tmp/test.go", editor: "cat"}
+	m = updateTestModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.fileModal != nil {
+		t.Fatal("modal should be nil after esc")
+	}
+}
+
+func TestSafeArtifactPathRejectsTraversal(t *testing.T) {
+	_, ok := safeArtifactPath("/home/user/repo", "../../../etc/passwd")
+	if ok {
+		t.Fatal("should reject path traversal")
+	}
+	_, ok = safeArtifactPath("/home/user/repo", "src/main.go")
+	if !ok {
+		t.Fatal("should accept relative path within repo")
+	}
+	abs, ok := safeArtifactPath("/home/user/repo", "/tmp/absolute.go")
+	if !ok {
+		t.Fatal("should accept absolute path")
+	}
+	if abs != "/tmp/absolute.go" {
+		t.Fatalf("abs = %q, want /tmp/absolute.go", abs)
+	}
+}
+
+func TestEditorCmdReturnsSomething(t *testing.T) {
+	ed := editorCmd()
+	t.Logf("editorCmd = %q", ed)
+}

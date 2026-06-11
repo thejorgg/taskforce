@@ -73,6 +73,16 @@ var builtins = map[string]builtin{
 			return withModelFlag([]string{"gemini", "--yolo", "-p", prompt}, "-m", model)
 		},
 	},
+	"mimo": {
+		plan: func(model, prompt string) []string {
+			argv := withModelFlag([]string{"mimo", "run", "--dangerously-skip-permissions"}, "--model", model)
+			return append(argv, prompt)
+		},
+		build: func(model, prompt string) []string {
+			argv := withModelFlag([]string{"mimo", "run", "--dangerously-skip-permissions"}, "--model", model)
+			return append(argv, prompt)
+		},
+	},
 }
 
 func withModelFlag(argv []string, flag, model string) []string {

@@ -100,6 +100,19 @@ func TestCodexSandboxPerMode(t *testing.T) {
 	}
 }
 
+func TestMimoBuiltinUsesRunAndNeverAsk(t *testing.T) {
+	spec, err := Resolve(Request{Stage: "relay.build", Mode: ModeBuild, Prompt: "fix it", Task: task(), Config: config.StageConfig{Agent: "mimo", Model: "mimo/auto"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(spec.Argv, " ")
+	for _, want := range []string{"mimo run", "--dangerously-skip-permissions", "--model mimo/auto", "fix it"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("mimo argv missing %q: %v", want, spec.Argv)
+		}
+	}
+}
+
 func TestDefaultAgents(t *testing.T) {
 	plan, err := Resolve(Request{Stage: "s", Mode: ModePlan, Prompt: "p", Task: task(), Config: config.StageConfig{}})
 	if err != nil || plan.Argv[0] != "codex" {

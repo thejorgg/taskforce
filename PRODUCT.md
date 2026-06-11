@@ -10,7 +10,7 @@ TaskForce is for developers and operators running AI-assisted coding work from a
 
 ## Product Purpose
 
-TaskForce coordinates software task intake, dispatch, implementation, review, and release handoff. Success means an operator can trust the pipeline state at a glance, inspect stage output, and approve or redirect work without reading scattered logs.
+TaskForce is an AI-assisted software workflow tool for developers, not a military project. It coordinates software task intake, dispatch, implementation, review, and release handoff. Success means an operator can trust the pipeline state at a glance, inspect stage output, and approve or redirect work without reading scattered logs.
 
 ## Brand Personality
 

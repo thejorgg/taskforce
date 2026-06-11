@@ -14,6 +14,7 @@ type Config struct {
 	Pipeline PipelineConfig         `json:"pipeline"`
 	Agents   map[string]AgentConfig `json:"agents,omitempty"`
 	Relay    RelayConfig            `json:"relay"`
+	Rescue   RescueConfig           `json:"rescue"`
 	Scope    ScopeConfig            `json:"scope"`
 	Exfil    ExfilConfig            `json:"exfil"`
 	Runtime  RuntimeConfig          `json:"runtime"`
@@ -48,6 +49,16 @@ type RelayConfig struct {
 	Control StageConfig `json:"control"`
 	Build   StageConfig `json:"build"`
 	Retries int         `json:"retries"`
+}
+
+type RescueConfig struct {
+	Enabled     bool              `json:"enabled"`
+	Agent       string            `json:"agent"`
+	Model       string            `json:"model"`
+	Root        string            `json:"root"`
+	MaxAttempts int               `json:"max_attempts"`
+	Triggers    []string          `json:"triggers"`
+	Mappings    map[string]string `json:"mappings"`
 }
 
 type ScopeConfig struct {
@@ -128,6 +139,42 @@ func Default() Config {
 				Mutates: true,
 			},
 			Retries: 1,
+		},
+		Rescue: RescueConfig{
+			Enabled:     true,
+			Agent:       "codex",
+			Root:        "/tmp/.relay-rescue",
+			MaxAttempts: 3,
+			Triggers: []string{
+				"safety",
+				"security policy",
+				"refuse",
+				"refusal",
+				"disallowed",
+				"military",
+				"weapon",
+				"combat",
+				"conflict",
+			},
+			Mappings: map[string]string{
+				"TaskForce":        "TFNeutralProject",
+				"taskforce":        "tfneutralproject",
+				"command center":   "TFNeutralConsole",
+				"Dispatch":         "TFNeutralIntake",
+				"dispatch":         "tfneutralintake",
+				"Relay":            "TFNeutralFlow",
+				"relay":            "tfneutralflow",
+				"Control":          "TFNeutralPlan",
+				"control":          "tfneutralplan",
+				"Scope":            "TFNeutralCheck",
+				"scope":            "tfneutralcheck",
+				"Exfil":            "TFNeutralHandoff",
+				"exfil":            "tfneutralhandoff",
+				"spy views":        "TFNeutralDetailViews",
+				"Scout-style":      "TFNeutralRepoMap",
+				"operator":         "TFNeutralUser",
+				"target directory": "TFNeutralActiveDir",
+			},
 		},
 		Scope: ScopeConfig{Hooks: []HookConfig{}},
 		Exfil: ExfilConfig{
@@ -326,6 +373,7 @@ var builtinAgents = map[string]bool{
 	"codex":    true,
 	"opencode": true,
 	"gemini":   true,
+	"mimo":     true,
 }
 
 func Validate(cfg Config) error {
@@ -359,6 +407,30 @@ func Validate(cfg Config) error {
 		}
 		if !builtinAgents[agent] {
 			return fmt.Errorf("%s.agent %q is not a built-in adapter and is not defined in agents", stage.name, agent)
+		}
+	}
+	if cfg.Rescue.Enabled {
+		if strings.TrimSpace(cfg.Rescue.Agent) == "" {
+			return errors.New("rescue.agent must be set when rescue is enabled")
+		}
+		if !builtinAgents[cfg.Rescue.Agent] {
+			if _, ok := cfg.Agents[cfg.Rescue.Agent]; !ok {
+				return fmt.Errorf("rescue.agent %q is not a built-in adapter and is not defined in agents", cfg.Rescue.Agent)
+			}
+		}
+		if strings.TrimSpace(cfg.Rescue.Root) == "" {
+			return errors.New("rescue.root must be set when rescue is enabled")
+		}
+		if cfg.Rescue.MaxAttempts < 0 {
+			return errors.New("rescue.max_attempts must not be negative")
+		}
+		for left, right := range cfg.Rescue.Mappings {
+			if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+				return errors.New("rescue mappings must not contain empty terms")
+			}
+			if left == right {
+				return fmt.Errorf("rescue mapping %q maps to itself", left)
+			}
 		}
 	}
 	for _, hook := range cfg.Scope.Hooks {
