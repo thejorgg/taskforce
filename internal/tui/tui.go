@@ -56,13 +56,13 @@ type Model struct {
 	static bool
 
 	// animation state
-	viewChangedAt      time.Time
-	quitPromptAt       time.Time
-	quitting           bool
-	quitStartedAt      time.Time
-	agentsStopped      bool
-	animTickInFlight   bool
-	animOff            bool
+	viewChangedAt    time.Time
+	quitPromptAt     time.Time
+	quitting         bool
+	quitStartedAt    time.Time
+	agentsStopped    bool
+	animTickInFlight bool
+	animOff          bool
 
 	run         domain.PipelineRun
 	record      *daemon.RunRecord
@@ -390,7 +390,7 @@ func (m *Model) refresh() {
 	if m.static {
 		return
 	}
-	state, ok, err := daemon.Status(m.repo)
+	state, ok, err := daemon.Status()
 	m.daemonState = state
 	m.daemonOK = err == nil && ok && state.Status == "running"
 	m.cfg, m.cfgPaths, m.cfgErr = config.LoadEffective(m.repo, "")

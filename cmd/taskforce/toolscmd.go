@@ -161,7 +161,7 @@ func doctorCmd(args []string) error {
 		checkHookBinary(report, "exfil."+hook.Name, hook)
 	}
 
-	state, ok, err := daemon.Status(absRepo)
+	state, ok, err := daemon.Status()
 	switch {
 	case err != nil:
 		report("warn", "daemon", err.Error())
