@@ -8,6 +8,11 @@ Echo -> Dispatch -> Relay -> Scope -> Exfil
 
 It is designed to be configurable, inspectable, and usable from a terminal. TaskForce owns orchestration, daemon state, run queues, TUI screens, logs, and release gates. Your existing tools still do the specialized work: Claude, Codex, opencode, Gemini, mimo, `go test ./...`, `npm test`, `gh pr create`, or any other command you configure.
 
+## DISCLAIMER
+
+> [!WARNING]
+> This software is EXTREMELY early and mostly **not** tested as of this notice.
+
 ## Pipeline
 
 - **Echo** collects raw signals and normalizes them.
